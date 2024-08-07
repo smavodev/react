@@ -5,7 +5,7 @@
 
 const expect = global.expect;
 
-const jestDiff = require('jest-diff').default;
+const {diff: jestDiff} = require('jest-diff');
 const util = require('util');
 
 function shouldIgnoreConsoleError(format, args) {
@@ -33,16 +33,6 @@ function shouldIgnoreConsoleError(format, args) {
       // They are noisy too so we'll try to ignore them.
       return true;
     }
-    if (
-      format.indexOf(
-        'act(...) is not supported in production builds of React'
-      ) === 0
-    ) {
-      // We don't yet support act() for prod builds, and warn for it.
-      // But we'd like to use act() ourselves for prod builds.
-      // Let's ignore the warning and #yolo.
-      return true;
-    }
   }
   // Looks legit
   return false;
@@ -59,7 +49,7 @@ function normalizeCodeLocInfo(str) {
   //  at Component (/path/filename.js:123:45)
   // React format:
   //    in Component (at filename.js:123)
-  return str.replace(/\n +(?:at|in) ([\S]+)[^\n]*/g, function(m, name) {
+  return str.replace(/\n +(?:at|in) ([\S]+)[^\n]*/g, function (m, name) {
     return '\n    in ' + name + ' (at **)';
   });
 }

@@ -1,5 +1,5 @@
 /**
- * Copyright (c) Facebook, Inc. and its affiliates.
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
  *
  * This source code is licensed under the MIT license found in the
  * LICENSE file in the root directory of this source tree.
@@ -12,8 +12,13 @@
 let React;
 
 let ReactDOM;
+let ReactDOMClient;
 let Scheduler;
 let act;
+let waitForAll;
+let waitFor;
+let waitForMicrotasks;
+let assertLog;
 
 const setUntrackedInputValue = Object.getOwnPropertyDescriptor(
   HTMLInputElement.prototype,
@@ -24,21 +29,29 @@ describe('ReactDOMFiberAsync', () => {
   let container;
 
   beforeEach(() => {
-    jest.resetModules();
     container = document.createElement('div');
     React = require('react');
     ReactDOM = require('react-dom');
-    act = require('react-dom/test-utils').unstable_concurrentAct;
+    ReactDOMClient = require('react-dom/client');
+    act = require('internal-test-utils').act;
     Scheduler = require('scheduler');
 
+    const InternalTestUtils = require('internal-test-utils');
+    waitForAll = InternalTestUtils.waitForAll;
+    waitFor = InternalTestUtils.waitFor;
+    waitForMicrotasks = InternalTestUtils.waitForMicrotasks;
+    assertLog = InternalTestUtils.assertLog;
+
     document.body.appendChild(container);
+    window.event = undefined;
   });
 
   afterEach(() => {
     document.body.removeChild(container);
   });
 
-  it('renders synchronously by default', () => {
+  // @gate !disableLegacyMode
+  it('renders synchronously by default in legacy mode', () => {
     const ops = [];
     ReactDOM.render(<div>Hi</div>, container, () => {
       ops.push(container.textContent);
@@ -49,12 +62,16 @@ describe('ReactDOMFiberAsync', () => {
     expect(ops).toEqual(['Hi', 'Bye']);
   });
 
-  it('flushSync batches sync updates and flushes them at the end of the batch', () => {
+  it('flushSync batches sync updates and flushes them at the end of the batch', async () => {
     const ops = [];
     let instance;
 
     class Component extends React.Component {
       state = {text: ''};
+      componentDidMount() {
+        instance = this;
+      }
+
       push(val) {
         this.setState(state => ({text: state.text + val}));
       }
@@ -67,9 +84,13 @@ describe('ReactDOMFiberAsync', () => {
       }
     }
 
-    ReactDOM.render(<Component />, container);
+    const root = ReactDOMClient.createRoot(container);
+    await act(() => root.render(<Component />));
 
-    instance.push('A');
+    await act(() => {
+      instance.push('A');
+    });
+
     expect(ops).toEqual(['A']);
     expect(container.textContent).toEqual('A');
 
@@ -80,19 +101,26 @@ describe('ReactDOMFiberAsync', () => {
       expect(container.textContent).toEqual('A');
       expect(ops).toEqual(['A']);
     });
+
     expect(container.textContent).toEqual('ABC');
     expect(ops).toEqual(['A', 'ABC']);
-    instance.push('D');
+    await act(() => {
+      instance.push('D');
+    });
     expect(container.textContent).toEqual('ABCD');
     expect(ops).toEqual(['A', 'ABC', 'ABCD']);
   });
 
-  it('flushSync flushes updates even if nested inside another flushSync', () => {
+  it('flushSync flushes updates even if nested inside another flushSync', async () => {
     const ops = [];
     let instance;
 
     class Component extends React.Component {
       state = {text: ''};
+      componentDidMount() {
+        instance = this;
+      }
+
       push(val) {
         this.setState(state => ({text: state.text + val}));
       }
@@ -105,9 +133,12 @@ describe('ReactDOMFiberAsync', () => {
       }
     }
 
-    ReactDOM.render(<Component />, container);
+    const root = ReactDOMClient.createRoot(container);
+    await act(() => root.render(<Component />));
 
-    instance.push('A');
+    await act(() => {
+      instance.push('A');
+    });
     expect(ops).toEqual(['A']);
     expect(container.textContent).toEqual('A');
 
@@ -129,10 +160,10 @@ describe('ReactDOMFiberAsync', () => {
     expect(ops).toEqual(['A', 'ABCD']);
   });
 
-  it('flushSync logs an error if already performing work', () => {
+  it('flushSync logs an error if already performing work', async () => {
     class Component extends React.Component {
       componentDidUpdate() {
-        ReactDOM.flushSync(() => {});
+        ReactDOM.flushSync();
       }
       render() {
         return null;
@@ -140,23 +171,20 @@ describe('ReactDOMFiberAsync', () => {
     }
 
     // Initial mount
-    ReactDOM.render(<Component />, container);
+    const root = ReactDOMClient.createRoot(container);
+    await act(() => {
+      root.render(<Component />);
+    });
     // Update
-    expect(() => ReactDOM.render(<Component />, container)).toErrorDev(
-      'flushSync was called from inside a lifecycle method',
-    );
+    expect(() => {
+      ReactDOM.flushSync(() => {
+        root.render(<Component />);
+      });
+    }).toErrorDev('flushSync was called from inside a lifecycle method');
   });
 
   describe('concurrent mode', () => {
-    beforeEach(() => {
-      jest.resetModules();
-
-      ReactDOM = require('react-dom');
-      Scheduler = require('scheduler');
-    });
-
-    // @gate experimental
-    it('does not perform deferred updates synchronously', () => {
+    it('does not perform deferred updates synchronously', async () => {
       const inputRef = React.createRef();
       const asyncValueRef = React.createRef();
       const syncValueRef = React.createRef();
@@ -166,7 +194,7 @@ describe('ReactDOMFiberAsync', () => {
 
         handleChange = e => {
           const nextValue = e.target.value;
-          requestIdleCallback(() => {
+          React.startTransition(() => {
             this.setState({
               asyncValue: nextValue,
             });
@@ -192,41 +220,42 @@ describe('ReactDOMFiberAsync', () => {
           );
         }
       }
-      const root = ReactDOM.unstable_createRoot(container);
-      root.render(<Counter />);
-      Scheduler.unstable_flushAll();
+      const root = ReactDOMClient.createRoot(container);
+      await act(() => root.render(<Counter />));
       expect(asyncValueRef.current.textContent).toBe('');
       expect(syncValueRef.current.textContent).toBe('');
 
-      setUntrackedInputValue.call(inputRef.current, 'hello');
-      inputRef.current.dispatchEvent(new MouseEvent('input', {bubbles: true}));
-      // Should only flush non-deferred update.
-      expect(asyncValueRef.current.textContent).toBe('');
-      expect(syncValueRef.current.textContent).toBe('hello');
+      await act(() => {
+        setUntrackedInputValue.call(inputRef.current, 'hello');
+        inputRef.current.dispatchEvent(
+          new MouseEvent('input', {bubbles: true}),
+        );
+        // Should only flush non-deferred update.
+        expect(asyncValueRef.current.textContent).toBe('');
+        expect(syncValueRef.current.textContent).toBe('hello');
+      });
 
       // Should flush both updates now.
-      jest.runAllTimers();
-      Scheduler.unstable_flushAll();
       expect(asyncValueRef.current.textContent).toBe('hello');
       expect(syncValueRef.current.textContent).toBe('hello');
     });
 
-    // @gate experimental
-    it('top-level updates are concurrent', () => {
-      const root = ReactDOM.unstable_createRoot(container);
-      root.render(<div>Hi</div>);
-      expect(container.textContent).toEqual('');
-      Scheduler.unstable_flushAll();
+    it('top-level updates are concurrent', async () => {
+      const root = ReactDOMClient.createRoot(container);
+      await act(() => {
+        root.render(<div>Hi</div>);
+        expect(container.textContent).toEqual('');
+      });
       expect(container.textContent).toEqual('Hi');
 
-      root.render(<div>Bye</div>);
-      expect(container.textContent).toEqual('Hi');
-      Scheduler.unstable_flushAll();
+      await act(() => {
+        root.render(<div>Bye</div>);
+        expect(container.textContent).toEqual('Hi');
+      });
       expect(container.textContent).toEqual('Bye');
     });
 
-    // @gate experimental
-    it('deep updates (setState) are concurrent', () => {
+    it('deep updates (setState) are concurrent', async () => {
       let instance;
       class Component extends React.Component {
         state = {step: 0};
@@ -236,21 +265,22 @@ describe('ReactDOMFiberAsync', () => {
         }
       }
 
-      const root = ReactDOM.unstable_createRoot(container);
-      root.render(<Component />);
-      expect(container.textContent).toEqual('');
-      Scheduler.unstable_flushAll();
+      const root = ReactDOMClient.createRoot(container);
+
+      await act(() => {
+        root.render(<Component />);
+        expect(container.textContent).toEqual('');
+      });
       expect(container.textContent).toEqual('0');
 
-      instance.setState({step: 1});
-      expect(container.textContent).toEqual('0');
-      Scheduler.unstable_flushAll();
+      await act(() => {
+        instance.setState({step: 1});
+        expect(container.textContent).toEqual('0');
+      });
       expect(container.textContent).toEqual('1');
     });
 
-    // @gate experimental
-    it('flushSync flushes updates before end of the tick', () => {
-      const ops = [];
+    it('flushSync flushes updates before end of the tick', async () => {
       let instance;
 
       class Component extends React.Component {
@@ -259,7 +289,7 @@ describe('ReactDOMFiberAsync', () => {
           this.setState(state => ({text: state.text + val}));
         }
         componentDidUpdate() {
-          ops.push(this.state.text);
+          Scheduler.log(this.state.text);
         }
         render() {
           instance = this;
@@ -267,13 +297,12 @@ describe('ReactDOMFiberAsync', () => {
         }
       }
 
-      const root = ReactDOM.unstable_createRoot(container);
-      root.render(<Component />);
-      Scheduler.unstable_flushAll();
+      const root = ReactDOMClient.createRoot(container);
+      await act(() => root.render(<Component />));
 
       // Updates are async by default
       instance.push('A');
-      expect(ops).toEqual([]);
+      assertLog([]);
       expect(container.textContent).toEqual('');
 
       ReactDOM.flushSync(() => {
@@ -281,219 +310,96 @@ describe('ReactDOMFiberAsync', () => {
         instance.push('C');
         // Not flushed yet
         expect(container.textContent).toEqual('');
-        expect(ops).toEqual([]);
+        assertLog([]);
       });
       // Only the active updates have flushed
-      expect(container.textContent).toEqual('BC');
-      expect(ops).toEqual(['BC']);
+      expect(container.textContent).toEqual('ABC');
+      assertLog(['ABC']);
 
-      instance.push('D');
-      expect(container.textContent).toEqual('BC');
-      expect(ops).toEqual(['BC']);
-
-      // Flush the async updates
-      Scheduler.unstable_flushAll();
+      await act(() => {
+        instance.push('D');
+        expect(container.textContent).toEqual('ABC');
+        assertLog([]);
+      });
+      assertLog(['ABCD']);
       expect(container.textContent).toEqual('ABCD');
-      expect(ops).toEqual(['BC', 'ABCD']);
     });
 
-    // @gate experimental
-    it('flushControlled flushes updates before yielding to browser', () => {
-      let inst;
-      class Counter extends React.Component {
-        state = {counter: 0};
-        increment = () =>
-          this.setState(state => ({counter: state.counter + 1}));
-        render() {
-          inst = this;
-          return this.state.counter;
-        }
-      }
-      const root = ReactDOM.unstable_createRoot(container);
-      root.render(<Counter />);
-      Scheduler.unstable_flushAll();
-      expect(container.textContent).toEqual('0');
-
-      // Test that a normal update is async
-      inst.increment();
-      expect(container.textContent).toEqual('0');
-      Scheduler.unstable_flushAll();
-      expect(container.textContent).toEqual('1');
-
-      const ops = [];
-      ReactDOM.unstable_flushControlled(() => {
-        inst.increment();
-        ReactDOM.unstable_flushControlled(() => {
-          inst.increment();
-          ops.push('end of inner flush: ' + container.textContent);
-        });
-        ops.push('end of outer flush: ' + container.textContent);
-      });
-      ops.push('after outer flush: ' + container.textContent);
-      expect(ops).toEqual([
-        'end of inner flush: 1',
-        'end of outer flush: 1',
-        'after outer flush: 3',
-      ]);
-    });
-
-    // @gate experimental
-    it('flushControlled does not flush until end of outermost batchedUpdates', () => {
-      let inst;
-      class Counter extends React.Component {
-        state = {counter: 0};
-        increment = () =>
-          this.setState(state => ({counter: state.counter + 1}));
-        render() {
-          inst = this;
-          return this.state.counter;
-        }
-      }
-      ReactDOM.render(<Counter />, container);
-
-      const ops = [];
-      ReactDOM.unstable_batchedUpdates(() => {
-        inst.increment();
-        ReactDOM.unstable_flushControlled(() => {
-          inst.increment();
-          ops.push('end of flushControlled fn: ' + container.textContent);
-        });
-        ops.push('end of batchedUpdates fn: ' + container.textContent);
-      });
-      ops.push('after batchedUpdates: ' + container.textContent);
-      expect(ops).toEqual([
-        'end of flushControlled fn: 0',
-        'end of batchedUpdates fn: 0',
-        'after batchedUpdates: 2',
-      ]);
-    });
-
-    // @gate experimental
-    it('flushControlled returns nothing', () => {
-      // In the future, we may want to return a thenable "work" object.
-      let inst;
-      class Counter extends React.Component {
-        state = {counter: 0};
-        increment = () =>
-          this.setState(state => ({counter: state.counter + 1}));
-        render() {
-          inst = this;
-          return this.state.counter;
-        }
-      }
-      ReactDOM.render(<Counter />, container);
-      expect(container.textContent).toEqual('0');
-
-      const returnValue = ReactDOM.unstable_flushControlled(() => {
-        inst.increment();
-        return 'something';
-      });
-      expect(container.textContent).toEqual('1');
-      expect(returnValue).toBe(undefined);
-    });
-
-    // @gate experimental
-    it('ignores discrete events on a pending removed element', () => {
+    it('ignores discrete events on a pending removed element', async () => {
       const disableButtonRef = React.createRef();
       const submitButtonRef = React.createRef();
 
-      let formSubmitted = false;
-
-      class Form extends React.Component {
-        state = {active: true};
-        disableForm = () => {
-          this.setState({active: false});
-        };
-        submitForm = () => {
-          formSubmitted = true; // This should not get invoked
-        };
-        render() {
-          return (
-            <div>
-              <button onClick={this.disableForm} ref={disableButtonRef}>
-                Disable
-              </button>
-              {this.state.active ? (
-                <button onClick={this.submitForm} ref={submitButtonRef}>
-                  Submit
-                </button>
-              ) : null}
-            </div>
-          );
+      function Form() {
+        const [active, setActive] = React.useState(true);
+        function disableForm() {
+          setActive(false);
         }
+
+        return (
+          <div>
+            <button onClick={disableForm} ref={disableButtonRef}>
+              Disable
+            </button>
+            {active ? <button ref={submitButtonRef}>Submit</button> : null}
+          </div>
+        );
       }
 
-      const root = ReactDOM.unstable_createRoot(container);
-      root.render(<Form />);
-      // Flush
-      Scheduler.unstable_flushAll();
+      const root = ReactDOMClient.createRoot(container);
+      await act(() => {
+        root.render(<Form />);
+      });
 
       const disableButton = disableButtonRef.current;
       expect(disableButton.tagName).toBe('BUTTON');
+
+      const submitButton = submitButtonRef.current;
+      expect(submitButton.tagName).toBe('BUTTON');
 
       // Dispatch a click event on the Disable-button.
       const firstEvent = document.createEvent('Event');
       firstEvent.initEvent('click', true, true);
       disableButton.dispatchEvent(firstEvent);
 
-      // There should now be a pending update to disable the form.
-
-      // This should not have flushed yet since it's in concurrent mode.
-      const submitButton = submitButtonRef.current;
-      expect(submitButton.tagName).toBe('BUTTON');
-
-      // In the meantime, we can dispatch a new client event on the submit button.
-      const secondEvent = document.createEvent('Event');
-      secondEvent.initEvent('click', true, true);
-      // This should force the pending update to flush which disables the submit button before the event is invoked.
-      submitButton.dispatchEvent(secondEvent);
-
-      // Therefore the form should never have been submitted.
-      expect(formSubmitted).toBe(false);
-
-      expect(submitButtonRef.current).toBe(null);
+      // The click event is flushed synchronously, even in concurrent mode.
+      expect(submitButton.current).toBe(undefined);
     });
 
-    // @gate experimental
-    it('ignores discrete events on a pending removed event listener', () => {
+    it('ignores discrete events on a pending removed event listener', async () => {
       const disableButtonRef = React.createRef();
       const submitButtonRef = React.createRef();
 
       let formSubmitted = false;
 
-      class Form extends React.Component {
-        state = {active: true};
-        disableForm = () => {
-          this.setState({active: false});
-        };
-        submitForm = () => {
+      function Form() {
+        const [active, setActive] = React.useState(true);
+        function disableForm() {
+          setActive(false);
+        }
+        function submitForm() {
           formSubmitted = true; // This should not get invoked
-        };
-        disabledSubmitForm = () => {
+        }
+        function disabledSubmitForm() {
           // The form is disabled.
-        };
-        render() {
-          return (
-            <div>
-              <button onClick={this.disableForm} ref={disableButtonRef}>
-                Disable
-              </button>
-              <button
-                onClick={
-                  this.state.active ? this.submitForm : this.disabledSubmitForm
-                }
-                ref={submitButtonRef}>
-                Submit
-              </button>
-            </div>
-          );
         }
+        return (
+          <div>
+            <button onClick={disableForm} ref={disableButtonRef}>
+              Disable
+            </button>
+            <button
+              onClick={active ? submitForm : disabledSubmitForm}
+              ref={submitButtonRef}>
+              Submit
+            </button>
+          </div>
+        );
       }
 
-      const root = ReactDOM.unstable_createRoot(container);
-      root.render(<Form />);
-      // Flush
-      Scheduler.unstable_flushAll();
+      const root = ReactDOMClient.createRoot(container);
+      await act(() => {
+        root.render(<Form />);
+      });
 
       const disableButton = disableButtonRef.current;
       expect(disableButton.tagName).toBe('BUTTON');
@@ -501,7 +407,9 @@ describe('ReactDOMFiberAsync', () => {
       // Dispatch a click event on the Disable-button.
       const firstEvent = document.createEvent('Event');
       firstEvent.initEvent('click', true, true);
-      disableButton.dispatchEvent(firstEvent);
+      await act(() => {
+        disableButton.dispatchEvent(firstEvent);
+      });
 
       // There should now be a pending update to disable the form.
 
@@ -513,48 +421,44 @@ describe('ReactDOMFiberAsync', () => {
       const secondEvent = document.createEvent('Event');
       secondEvent.initEvent('click', true, true);
       // This should force the pending update to flush which disables the submit button before the event is invoked.
-      submitButton.dispatchEvent(secondEvent);
+      await act(() => {
+        submitButton.dispatchEvent(secondEvent);
+      });
 
       // Therefore the form should never have been submitted.
       expect(formSubmitted).toBe(false);
     });
 
-    // @gate experimental
-    it('uses the newest discrete events on a pending changed event listener', () => {
+    it('uses the newest discrete events on a pending changed event listener', async () => {
       const enableButtonRef = React.createRef();
       const submitButtonRef = React.createRef();
 
       let formSubmitted = false;
 
-      class Form extends React.Component {
-        state = {active: false};
-        enableForm = () => {
-          this.setState({active: true});
-        };
-        submitForm = () => {
-          formSubmitted = true; // This should happen
-        };
-        render() {
-          return (
-            <div>
-              <button onClick={this.enableForm} ref={enableButtonRef}>
-                Enable
-              </button>
-              <button
-                onClick={this.state.active ? this.submitForm : null}
-                ref={submitButtonRef}>
-                Submit
-              </button>{' '}
-              : null}
-            </div>
-          );
+      function Form() {
+        const [active, setActive] = React.useState(false);
+        function enableForm() {
+          setActive(true);
         }
+        function submitForm() {
+          formSubmitted = true; // This should not get invoked
+        }
+        return (
+          <div>
+            <button onClick={enableForm} ref={enableButtonRef}>
+              Enable
+            </button>
+            <button onClick={active ? submitForm : null} ref={submitButtonRef}>
+              Submit
+            </button>
+          </div>
+        );
       }
 
-      const root = ReactDOM.unstable_createRoot(container);
-      root.render(<Form />);
-      // Flush
-      Scheduler.unstable_flushAll();
+      const root = ReactDOMClient.createRoot(container);
+      await act(() => {
+        root.render(<Form />);
+      });
 
       const enableButton = enableButtonRef.current;
       expect(enableButton.tagName).toBe('BUTTON');
@@ -562,7 +466,9 @@ describe('ReactDOMFiberAsync', () => {
       // Dispatch a click event on the Enable-button.
       const firstEvent = document.createEvent('Event');
       firstEvent.initEvent('click', true, true);
-      enableButton.dispatchEvent(firstEvent);
+      await act(() => {
+        enableButton.dispatchEvent(firstEvent);
+      });
 
       // There should now be a pending update to enable the form.
 
@@ -574,14 +480,16 @@ describe('ReactDOMFiberAsync', () => {
       const secondEvent = document.createEvent('Event');
       secondEvent.initEvent('click', true, true);
       // This should force the pending update to flush which enables the submit button before the event is invoked.
-      submitButton.dispatchEvent(secondEvent);
+      await act(() => {
+        submitButton.dispatchEvent(secondEvent);
+      });
 
       // Therefore the form should have been submitted.
       expect(formSubmitted).toBe(true);
     });
   });
 
-  it('regression test: does not drop passive effects across roots (#17066)', () => {
+  it('regression test: does not drop passive effects across roots (#17066)', async () => {
     const {useState, useEffect} = React;
 
     function App({label}) {
@@ -599,47 +507,46 @@ describe('ReactDOMFiberAsync', () => {
     const containerA = document.createElement('div');
     const containerB = document.createElement('div');
     const containerC = document.createElement('div');
+    const rootA = ReactDOMClient.createRoot(containerA);
+    const rootB = ReactDOMClient.createRoot(containerB);
+    const rootC = ReactDOMClient.createRoot(containerC);
 
-    ReactDOM.render(<App label="A" />, containerA);
-    ReactDOM.render(<App label="B" />, containerB);
-    ReactDOM.render(<App label="C" />, containerC);
-
-    Scheduler.unstable_flushAll();
+    await act(() => {
+      rootA.render(<App label="A" />);
+      rootB.render(<App label="B" />);
+      rootC.render(<App label="C" />);
+    });
 
     expect(containerA.textContent).toEqual('Finished');
     expect(containerB.textContent).toEqual('Finished');
     expect(containerC.textContent).toEqual('Finished');
   });
 
-  describe('createBlockingRoot', () => {
-    // @gate experimental
-    it('updates flush without yielding in the next event', () => {
-      const root = ReactDOM.unstable_createBlockingRoot(container);
+  it('updates flush without yielding in the next event', async () => {
+    const root = ReactDOMClient.createRoot(container);
 
-      function Text(props) {
-        Scheduler.unstable_yieldValue(props.text);
-        return props.text;
-      }
+    function Text(props) {
+      Scheduler.log(props.text);
+      return props.text;
+    }
 
-      root.render(
-        <>
-          <Text text="A" />
-          <Text text="B" />
-          <Text text="C" />
-        </>,
-      );
+    root.render(
+      <>
+        <Text text="A" />
+        <Text text="B" />
+        <Text text="C" />
+      </>,
+    );
 
-      // Nothing should have rendered yet
-      expect(container.textContent).toEqual('');
+    // Nothing should have rendered yet
+    expect(container.textContent).toEqual('');
 
-      // Everything should render immediately in the next event
-      expect(Scheduler).toFlushExpired(['A', 'B', 'C']);
-      expect(container.textContent).toEqual('ABC');
-    });
+    // Everything should render immediately in the next event
+    await waitForAll(['A', 'B', 'C']);
+    expect(container.textContent).toEqual('ABC');
   });
 
-  // @gate experimental
-  it('unmounted roots should never clear newer root content from a container', () => {
+  it('unmounted roots should never clear newer root content from a container', async () => {
     const ref = React.createRef();
 
     function OldApp() {
@@ -661,8 +568,8 @@ describe('ReactDOMFiberAsync', () => {
       return <button ref={ref}>new</button>;
     }
 
-    const oldRoot = ReactDOM.unstable_createRoot(container);
-    act(() => {
+    const oldRoot = ReactDOMClient.createRoot(container);
+    await act(() => {
       oldRoot.render(<OldApp />);
     });
 
@@ -673,12 +580,252 @@ describe('ReactDOMFiberAsync', () => {
     expect(container.textContent).toBe('');
 
     // We can now render a new one.
-    const newRoot = ReactDOM.unstable_createRoot(container);
+    const newRoot = ReactDOMClient.createRoot(container);
     ReactDOM.flushSync(() => {
       newRoot.render(<NewApp />);
     });
     ref.current.click();
 
     expect(container.textContent).toBe('new');
+  });
+
+  it('should synchronously render the transition lane scheduled in a popState', async () => {
+    function App() {
+      const [syncState, setSyncState] = React.useState(false);
+      const [hasNavigated, setHasNavigated] = React.useState(false);
+      function onPopstate() {
+        Scheduler.log(`popState`);
+        React.startTransition(() => {
+          setHasNavigated(true);
+        });
+        setSyncState(true);
+      }
+      React.useEffect(() => {
+        window.addEventListener('popstate', onPopstate);
+        return () => {
+          window.removeEventListener('popstate', onPopstate);
+        };
+      }, []);
+      Scheduler.log(`render:${hasNavigated}/${syncState}`);
+      return null;
+    }
+    const root = ReactDOMClient.createRoot(container);
+    await act(async () => {
+      root.render(<App />);
+    });
+    assertLog(['render:false/false']);
+
+    await act(async () => {
+      const popStateEvent = new Event('popstate');
+      // Jest is not emulating window.event correctly in the microtask
+      window.event = popStateEvent;
+      window.dispatchEvent(popStateEvent);
+      queueMicrotask(() => {
+        window.event = undefined;
+      });
+    });
+
+    assertLog(['popState', 'render:true/true']);
+    await act(() => {
+      root.unmount();
+    });
+  });
+
+  it('Should not flush transition lanes if there is no transition scheduled in popState', async () => {
+    let setHasNavigated;
+    function App() {
+      const [syncState, setSyncState] = React.useState(false);
+      const [hasNavigated, _setHasNavigated] = React.useState(false);
+      setHasNavigated = _setHasNavigated;
+      function onPopstate() {
+        setSyncState(true);
+      }
+
+      React.useEffect(() => {
+        window.addEventListener('popstate', onPopstate);
+        return () => {
+          window.removeEventListener('popstate', onPopstate);
+        };
+      }, []);
+
+      Scheduler.log(`render:${hasNavigated}/${syncState}`);
+      return null;
+    }
+    const root = ReactDOMClient.createRoot(container);
+    await act(async () => {
+      root.render(<App />);
+    });
+    assertLog(['render:false/false']);
+
+    React.startTransition(() => {
+      setHasNavigated(true);
+    });
+    await act(async () => {
+      const popStateEvent = new Event('popstate');
+      // Jest is not emulating window.event correctly in the microtask
+      window.event = popStateEvent;
+      window.dispatchEvent(popStateEvent);
+      queueMicrotask(() => {
+        window.event = undefined;
+      });
+    });
+    assertLog(['render:false/true', 'render:true/true']);
+    await act(() => {
+      root.unmount();
+    });
+  });
+
+  it('transition lane in popState should be allowed to suspend', async () => {
+    let resolvePromise;
+    const promise = new Promise(res => {
+      resolvePromise = res;
+    });
+
+    function Text({text}) {
+      Scheduler.log(text);
+      return text;
+    }
+
+    function App() {
+      const [pathname, setPathname] = React.useState('/path/a');
+
+      if (pathname !== '/path/a') {
+        try {
+          React.use(promise);
+        } catch (e) {
+          Scheduler.log(`Suspend! [${pathname}]`);
+          throw e;
+        }
+      }
+
+      React.useEffect(() => {
+        function onPopstate() {
+          React.startTransition(() => {
+            setPathname('/path/b');
+          });
+        }
+        window.addEventListener('popstate', onPopstate);
+        return () => window.removeEventListener('popstate', onPopstate);
+      }, []);
+
+      return (
+        <>
+          <Text text="Before" />
+          <div>
+            <Text text={pathname} />
+          </div>
+          <Text text="After" />
+        </>
+      );
+    }
+
+    const root = ReactDOMClient.createRoot(container);
+    await act(async () => {
+      root.render(<App />);
+    });
+    assertLog(['Before', '/path/a', 'After']);
+
+    const div = container.getElementsByTagName('div')[0];
+    expect(div.textContent).toBe('/path/a');
+
+    // Simulate a popstate event
+    await act(async () => {
+      const popStateEvent = new Event('popstate');
+
+      // Simulate a popstate event
+      window.event = popStateEvent;
+      window.dispatchEvent(popStateEvent);
+      await waitForMicrotasks();
+      window.event = undefined;
+
+      // The transition lane should have been attempted synchronously (in
+      // a microtask)
+      assertLog(['Suspend! [/path/b]']);
+      // Because it suspended, it remains on the current path
+      expect(div.textContent).toBe('/path/a');
+    });
+    assertLog(['Suspend! [/path/b]']);
+
+    await act(async () => {
+      resolvePromise();
+
+      // Since the transition previously suspended, there's no need for this
+      // transition to be rendered synchronously on susbequent attempts; if we
+      // fail to commit synchronously the first time, the scroll restoration
+      // state won't be restored anyway.
+      //
+      // Yield in between each child to prove that it's concurrent.
+      await waitForMicrotasks();
+      assertLog([]);
+
+      await waitFor(['Before']);
+      await waitFor(['/path/b']);
+      await waitFor(['After']);
+    });
+    assertLog([]);
+    expect(div.textContent).toBe('/path/b');
+    await act(() => {
+      root.unmount();
+    });
+  });
+
+  it('regression: infinite deferral loop caused by unstable useDeferredValue input', async () => {
+    function Text({text}) {
+      Scheduler.log(text);
+      return text;
+    }
+
+    let i = 0;
+    function App() {
+      const [pathname, setPathname] = React.useState('/path/a');
+      // This is an unstable input, so it will always cause a deferred render.
+      const {value: deferredPathname} = React.useDeferredValue({
+        value: pathname,
+      });
+      if (i++ > 100) {
+        throw new Error('Infinite loop detected');
+      }
+      React.useEffect(() => {
+        function onPopstate() {
+          React.startTransition(() => {
+            setPathname('/path/b');
+          });
+        }
+        window.addEventListener('popstate', onPopstate);
+        return () => window.removeEventListener('popstate', onPopstate);
+      }, []);
+
+      return <Text text={deferredPathname} />;
+    }
+
+    const root = ReactDOMClient.createRoot(container);
+    await act(() => {
+      root.render(<App />);
+    });
+    assertLog(['/path/a']);
+    expect(container.textContent).toBe('/path/a');
+
+    // Simulate a popstate event
+    await act(async () => {
+      const popStateEvent = new Event('popstate');
+
+      // Simulate a popstate event
+      window.event = popStateEvent;
+      window.dispatchEvent(popStateEvent);
+      await waitForMicrotasks();
+      window.event = undefined;
+
+      // The transition lane is attempted synchronously (in a microtask).
+      // Because the input to useDeferredValue is referentially unstable, it
+      // will spawn a deferred task at transition priority. However, even
+      // though it was spawned during a transition event, the spawned task
+      // not also be upgraded to sync.
+      assertLog(['/path/a']);
+    });
+    assertLog(['/path/b']);
+    expect(container.textContent).toBe('/path/b');
+    await act(() => {
+      root.unmount();
+    });
   });
 });

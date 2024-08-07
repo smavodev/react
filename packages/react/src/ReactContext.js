@@ -1,5 +1,5 @@
 /**
- * Copyright (c) Facebook, Inc. and its affiliates.
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
  *
  * This source code is licensed under the MIT license found in the
  * LICENSE file in the root directory of this source tree.
@@ -7,34 +7,21 @@
  * @flow
  */
 
-import {REACT_PROVIDER_TYPE, REACT_CONTEXT_TYPE} from 'shared/ReactSymbols';
+import {
+  REACT_PROVIDER_TYPE,
+  REACT_CONSUMER_TYPE,
+  REACT_CONTEXT_TYPE,
+} from 'shared/ReactSymbols';
 
 import type {ReactContext} from 'shared/ReactTypes';
+import {enableRenderableContext} from 'shared/ReactFeatureFlags';
 
-export function createContext<T>(
-  defaultValue: T,
-  calculateChangedBits: ?(a: T, b: T) => number,
-): ReactContext<T> {
-  if (calculateChangedBits === undefined) {
-    calculateChangedBits = null;
-  } else {
-    if (__DEV__) {
-      if (
-        calculateChangedBits !== null &&
-        typeof calculateChangedBits !== 'function'
-      ) {
-        console.error(
-          'createContext: Expected the optional second argument to be a ' +
-            'function. Instead received: %s',
-          calculateChangedBits,
-        );
-      }
-    }
-  }
+export function createContext<T>(defaultValue: T): ReactContext<T> {
+  // TODO: Second argument used to be an optional `calculateChangedBits`
+  // function. Warn to reserve for future use?
 
   const context: ReactContext<T> = {
     $$typeof: REACT_CONTEXT_TYPE,
-    _calculateChangedBits: calculateChangedBits,
     // As a workaround to support multiple concurrent renderers, we categorize
     // some renderers as primary and others as secondary. We only expect
     // there to be two concurrent renderers at most: React Native (primary) and
@@ -50,97 +37,71 @@ export function createContext<T>(
     Consumer: (null: any),
   };
 
-  context.Provider = {
-    $$typeof: REACT_PROVIDER_TYPE,
-    _context: context,
-  };
-
-  let hasWarnedAboutUsingNestedContextConsumers = false;
-  let hasWarnedAboutUsingConsumerProvider = false;
-  let hasWarnedAboutDisplayNameOnConsumer = false;
-
-  if (__DEV__) {
-    // A separate object, but proxies back to the original context object for
-    // backwards compatibility. It has a different $$typeof, so we can properly
-    // warn for the incorrect usage of Context as a Consumer.
-    const Consumer = {
-      $$typeof: REACT_CONTEXT_TYPE,
+  if (enableRenderableContext) {
+    context.Provider = context;
+    context.Consumer = {
+      $$typeof: REACT_CONSUMER_TYPE,
       _context: context,
-      _calculateChangedBits: context._calculateChangedBits,
     };
-    // $FlowFixMe: Flow complains about not setting a value, which is intentional here
-    Object.defineProperties(Consumer, {
-      Provider: {
-        get() {
-          if (!hasWarnedAboutUsingConsumerProvider) {
-            hasWarnedAboutUsingConsumerProvider = true;
-            console.error(
-              'Rendering <Context.Consumer.Provider> is not supported and will be removed in ' +
-                'a future major release. Did you mean to render <Context.Provider> instead?',
-            );
-          }
-          return context.Provider;
-        },
-        set(_Provider) {
-          context.Provider = _Provider;
-        },
-      },
-      _currentValue: {
-        get() {
-          return context._currentValue;
-        },
-        set(_currentValue) {
-          context._currentValue = _currentValue;
-        },
-      },
-      _currentValue2: {
-        get() {
-          return context._currentValue2;
-        },
-        set(_currentValue2) {
-          context._currentValue2 = _currentValue2;
-        },
-      },
-      _threadCount: {
-        get() {
-          return context._threadCount;
-        },
-        set(_threadCount) {
-          context._threadCount = _threadCount;
-        },
-      },
-      Consumer: {
-        get() {
-          if (!hasWarnedAboutUsingNestedContextConsumers) {
-            hasWarnedAboutUsingNestedContextConsumers = true;
-            console.error(
-              'Rendering <Context.Consumer.Consumer> is not supported and will be removed in ' +
-                'a future major release. Did you mean to render <Context.Consumer> instead?',
-            );
-          }
-          return context.Consumer;
-        },
-      },
-      displayName: {
-        get() {
-          return context.displayName;
-        },
-        set(displayName) {
-          if (!hasWarnedAboutDisplayNameOnConsumer) {
-            console.warn(
-              'Setting `displayName` on Context.Consumer has no effect. ' +
-                "You should set it directly on the context with Context.displayName = '%s'.",
-              displayName,
-            );
-            hasWarnedAboutDisplayNameOnConsumer = true;
-          }
-        },
-      },
-    });
-    // $FlowFixMe: Flow complains about missing properties because it doesn't understand defineProperty
-    context.Consumer = Consumer;
   } else {
-    context.Consumer = context;
+    (context: any).Provider = {
+      $$typeof: REACT_PROVIDER_TYPE,
+      _context: context,
+    };
+    if (__DEV__) {
+      const Consumer: any = {
+        $$typeof: REACT_CONTEXT_TYPE,
+        _context: context,
+      };
+      Object.defineProperties(Consumer, {
+        Provider: {
+          get() {
+            return context.Provider;
+          },
+          set(_Provider: any) {
+            context.Provider = _Provider;
+          },
+        },
+        _currentValue: {
+          get() {
+            return context._currentValue;
+          },
+          set(_currentValue: T) {
+            context._currentValue = _currentValue;
+          },
+        },
+        _currentValue2: {
+          get() {
+            return context._currentValue2;
+          },
+          set(_currentValue2: T) {
+            context._currentValue2 = _currentValue2;
+          },
+        },
+        _threadCount: {
+          get() {
+            return context._threadCount;
+          },
+          set(_threadCount: number) {
+            context._threadCount = _threadCount;
+          },
+        },
+        Consumer: {
+          get() {
+            return context.Consumer;
+          },
+        },
+        displayName: {
+          get() {
+            return context.displayName;
+          },
+          set(displayName: void | string) {},
+        },
+      });
+      (context: any).Consumer = Consumer;
+    } else {
+      (context: any).Consumer = context;
+    }
   }
 
   if (__DEV__) {

@@ -1,5 +1,5 @@
 /**
- * Copyright (c) Facebook, Inc. and its affiliates.
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
  *
  * This source code is licensed under the MIT license found in the
  * LICENSE file in the root directory of this source tree.
@@ -7,80 +7,87 @@
  * @flow
  */
 
+import type {Dispatcher} from 'react-reconciler/src/ReactInternalTypes';
 import type {
-  MutableSource,
-  MutableSourceGetSnapshotFn,
-  MutableSourceSubscribeFn,
   ReactContext,
+  StartTransitionOptions,
+  Usable,
+  Awaited,
 } from 'shared/ReactTypes';
-import type {OpaqueIDType} from 'react-reconciler/src/ReactFiberHostConfig';
+import {REACT_CONSUMER_TYPE} from 'shared/ReactSymbols';
 
-import invariant from 'shared/invariant';
+import ReactSharedInternals from 'shared/ReactSharedInternals';
 
-import ReactCurrentDispatcher from './ReactCurrentDispatcher';
+import {enableAsyncActions} from 'shared/ReactFeatureFlags';
+import {
+  enableContextProfiling,
+  enableLazyContextPropagation,
+} from '../../shared/ReactFeatureFlags';
 
 type BasicStateAction<S> = (S => S) | S;
 type Dispatch<A> = A => void;
 
 function resolveDispatcher() {
-  const dispatcher = ReactCurrentDispatcher.current;
-  invariant(
-    dispatcher !== null,
-    'Invalid hook call. Hooks can only be called inside of the body of a function component. This could happen for' +
-      ' one of the following reasons:\n' +
-      '1. You might have mismatching versions of React and the renderer (such as React DOM)\n' +
-      '2. You might be breaking the Rules of Hooks\n' +
-      '3. You might have more than one copy of React in the same app\n' +
-      'See https://reactjs.org/link/invalid-hook-call for tips about how to debug and fix this problem.',
-  );
-  return dispatcher;
+  const dispatcher = ReactSharedInternals.H;
+  if (__DEV__) {
+    if (dispatcher === null) {
+      console.error(
+        'Invalid hook call. Hooks can only be called inside of the body of a function component. This could happen for' +
+          ' one of the following reasons:\n' +
+          '1. You might have mismatching versions of React and the renderer (such as React DOM)\n' +
+          '2. You might be breaking the Rules of Hooks\n' +
+          '3. You might have more than one copy of React in the same app\n' +
+          'See https://react.dev/link/invalid-hook-call for tips about how to debug and fix this problem.',
+      );
+    }
+  }
+  // Will result in a null access error if accessed outside render phase. We
+  // intentionally don't throw our own error because this is in a hot path.
+  // Also helps ensure this is inlined.
+  return ((dispatcher: any): Dispatcher);
 }
 
 export function getCacheForType<T>(resourceType: () => T): T {
-  const dispatcher = resolveDispatcher();
-  // $FlowFixMe This is unstable, thus optional
+  const dispatcher = ReactSharedInternals.A;
+  if (!dispatcher) {
+    // If there is no dispatcher, then we treat this as not being cached.
+    return resourceType();
+  }
   return dispatcher.getCacheForType(resourceType);
 }
 
-export function useContext<T>(
-  Context: ReactContext<T>,
-  unstable_observedBits: number | boolean | void,
-): T {
+export function useContext<T>(Context: ReactContext<T>): T {
   const dispatcher = resolveDispatcher();
   if (__DEV__) {
-    if (unstable_observedBits !== undefined) {
+    if (Context.$$typeof === REACT_CONSUMER_TYPE) {
       console.error(
-        'useContext() second argument is reserved for future ' +
-          'use in React. Passing it is not supported. ' +
-          'You passed: %s.%s',
-        unstable_observedBits,
-        typeof unstable_observedBits === 'number' && Array.isArray(arguments[2])
-          ? '\n\nDid you call array.map(useContext)? ' +
-              'Calling Hooks inside a loop is not supported. ' +
-              'Learn more at https://reactjs.org/link/rules-of-hooks'
-          : '',
+        'Calling useContext(Context.Consumer) is not supported and will cause bugs. ' +
+          'Did you mean to call useContext(Context) instead?',
       );
     }
+  }
+  return dispatcher.useContext(Context);
+}
 
-    // TODO: add a more generic warning for invalid values.
-    if ((Context: any)._context !== undefined) {
-      const realContext = (Context: any)._context;
-      // Don't deduplicate because this legitimately causes bugs
-      // and nobody should be using this in existing code.
-      if (realContext.Consumer === Context) {
-        console.error(
-          'Calling useContext(Context.Consumer) is not supported, may cause bugs, and will be ' +
-            'removed in a future major release. Did you mean to call useContext(Context) instead?',
-        );
-      } else if (realContext.Provider === Context) {
-        console.error(
-          'Calling useContext(Context.Provider) is not supported. ' +
-            'Did you mean to call useContext(Context) instead?',
-        );
-      }
+export function unstable_useContextWithBailout<T>(
+  context: ReactContext<T>,
+  select: (T => Array<mixed>) | null,
+): T {
+  if (!(enableLazyContextPropagation && enableContextProfiling)) {
+    throw new Error('Not implemented.');
+  }
+
+  const dispatcher = resolveDispatcher();
+  if (__DEV__) {
+    if (context.$$typeof === REACT_CONSUMER_TYPE) {
+      console.error(
+        'Calling useContext(Context.Consumer) is not supported and will cause bugs. ' +
+          'Did you mean to call useContext(Context) instead?',
+      );
     }
   }
-  return dispatcher.useContext(Context, unstable_observedBits);
+  // $FlowFixMe[not-a-function] This is unstable, thus optional
+  return dispatcher.unstable_useContextWithBailout(context, select);
 }
 
 export function useState<S>(
@@ -99,7 +106,7 @@ export function useReducer<S, I, A>(
   return dispatcher.useReducer(reducer, initialArg, init);
 }
 
-export function useRef<T>(initialValue: T): {|current: T|} {
+export function useRef<T>(initialValue: T): {current: T} {
   const dispatcher = resolveDispatcher();
   return dispatcher.useRef(initialValue);
 }
@@ -110,6 +117,14 @@ export function useEffect(
 ): void {
   const dispatcher = resolveDispatcher();
   return dispatcher.useEffect(create, deps);
+}
+
+export function useInsertionEffect(
+  create: () => (() => void) | void,
+  deps: Array<mixed> | void | null,
+): void {
+  const dispatcher = resolveDispatcher();
+  return dispatcher.useInsertionEffect(create, deps);
 }
 
 export function useLayoutEffect(
@@ -137,7 +152,7 @@ export function useMemo<T>(
 }
 
 export function useImperativeHandle<T>(
-  ref: {|current: T | null|} | ((inst: T | null) => mixed) | null | void,
+  ref: {current: T | null} | ((inst: T | null) => mixed) | null | void,
   create: () => T,
   deps: Array<mixed> | void | null,
 ): void {
@@ -155,34 +170,81 @@ export function useDebugValue<T>(
   }
 }
 
-export const emptyObject = {};
-
-export function useTransition(): [(() => void) => void, boolean] {
+export function useTransition(): [
+  boolean,
+  (callback: () => void, options?: StartTransitionOptions) => void,
+] {
   const dispatcher = resolveDispatcher();
   return dispatcher.useTransition();
 }
 
-export function useDeferredValue<T>(value: T): T {
+export function useDeferredValue<T>(value: T, initialValue?: T): T {
   const dispatcher = resolveDispatcher();
-  return dispatcher.useDeferredValue(value);
+  return dispatcher.useDeferredValue(value, initialValue);
 }
 
-export function useOpaqueIdentifier(): OpaqueIDType | void {
+export function useId(): string {
   const dispatcher = resolveDispatcher();
-  return dispatcher.useOpaqueIdentifier();
+  return dispatcher.useId();
 }
 
-export function useMutableSource<Source, Snapshot>(
-  source: MutableSource<Source>,
-  getSnapshot: MutableSourceGetSnapshotFn<Source, Snapshot>,
-  subscribe: MutableSourceSubscribeFn<Source, Snapshot>,
-): Snapshot {
+export function useSyncExternalStore<T>(
+  subscribe: (() => void) => () => void,
+  getSnapshot: () => T,
+  getServerSnapshot?: () => T,
+): T {
   const dispatcher = resolveDispatcher();
-  return dispatcher.useMutableSource(source, getSnapshot, subscribe);
+  return dispatcher.useSyncExternalStore(
+    subscribe,
+    getSnapshot,
+    getServerSnapshot,
+  );
 }
 
 export function useCacheRefresh(): <T>(?() => T, ?T) => void {
   const dispatcher = resolveDispatcher();
-  // $FlowFixMe This is unstable, thus optional
+  // $FlowFixMe[not-a-function] This is unstable, thus optional
   return dispatcher.useCacheRefresh();
+}
+
+export function use<T>(usable: Usable<T>): T {
+  const dispatcher = resolveDispatcher();
+  return dispatcher.use(usable);
+}
+
+export function useMemoCache(size: number): Array<any> {
+  const dispatcher = resolveDispatcher();
+  // $FlowFixMe[not-a-function] This is unstable, thus optional
+  return dispatcher.useMemoCache(size);
+}
+
+export function useEffectEvent<Args, F: (...Array<Args>) => mixed>(
+  callback: F,
+): F {
+  const dispatcher = resolveDispatcher();
+  // $FlowFixMe[not-a-function] This is unstable, thus optional
+  return dispatcher.useEffectEvent(callback);
+}
+
+export function useOptimistic<S, A>(
+  passthrough: S,
+  reducer: ?(S, A) => S,
+): [S, (A) => void] {
+  const dispatcher = resolveDispatcher();
+  // $FlowFixMe[not-a-function] This is unstable, thus optional
+  return dispatcher.useOptimistic(passthrough, reducer);
+}
+
+export function useActionState<S, P>(
+  action: (Awaited<S>, P) => S,
+  initialState: Awaited<S>,
+  permalink?: string,
+): [Awaited<S>, (P) => void, boolean] {
+  if (!enableAsyncActions) {
+    throw new Error('Not implemented.');
+  } else {
+    const dispatcher = resolveDispatcher();
+    // $FlowFixMe[not-a-function] This is unstable, thus optional
+    return dispatcher.useActionState(action, initialState, permalink);
+  }
 }

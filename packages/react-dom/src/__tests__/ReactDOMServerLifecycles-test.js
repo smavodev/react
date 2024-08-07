@@ -1,5 +1,5 @@
 /**
- * Copyright (c) Facebook, Inc. and its affiliates.
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
  *
  * This source code is licensed under the MIT license found in the
  * LICENSE file in the root directory of this source tree.
@@ -16,7 +16,7 @@ let ReactDOMServer;
 
 function initModules() {
   // Reset warning cache.
-  jest.resetModuleRegistry();
+  jest.resetModules();
   React = require('react');
   ReactDOMServer = require('react-dom/server');
 
@@ -115,7 +115,9 @@ describe('ReactDOMServerLifecycles', () => {
       }
     }
 
-    ReactDOMServer.renderToString(<Component />);
+    expect(() => ReactDOMServer.renderToString(<Component />)).toErrorDev(
+      'Unsafe legacy lifecycles will not be called for components using new component APIs.',
+    );
   });
 
   it('should update instance.state with value returned from getDerivedStateFromProps', () => {
@@ -258,7 +260,7 @@ describe('ReactDOMServerLifecycles', () => {
         '<div>1-2</div>',
       );
     }).toErrorDev(
-      'Warning: setState(...): Can only update a mounting component. This ' +
+      'Can only update a mounting component. This ' +
         'usually means you called setState() outside componentWillMount() on ' +
         'the server. This is a no-op.\n\n' +
         'Please check the code for the Outer component.',
@@ -279,8 +281,8 @@ describe('ReactDOMServerLifecycles', () => {
       }
     }
 
-    expect(() => ReactDOMServer.renderToString(<Component />)).toWarnDev(
-      'componentWillMount has been renamed',
+    expect(() => ReactDOMServer.renderToString(<Component />)).toErrorDev(
+      'Unsafe legacy lifecycles will not be called for components using new component APIs.',
     );
   });
 
@@ -293,7 +295,7 @@ describe('ReactDOMServerLifecycles', () => {
     }
 
     expect(() => ReactDOMServer.renderToString(<MyComponent />)).toWarnDev(
-      'componentWillMount has been renamed, and is not recommended for use. See https://reactjs.org/link/unsafe-component-lifecycles for details.\n\n' +
+      'componentWillMount has been renamed, and is not recommended for use. See https://react.dev/link/unsafe-component-lifecycles for details.\n\n' +
         '* Move code from componentWillMount to componentDidMount (preferred in most cases) or the constructor.\n\n' +
         'Please update the following components: MyComponent',
     );

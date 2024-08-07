@@ -1,5 +1,5 @@
 /**
- * Copyright (c) Facebook, Inc. and its affiliates.
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
  *
  * This source code is licensed under the MIT license found in the
  * LICENSE file in the root directory of this source tree.
@@ -7,71 +7,58 @@
  * @flow
  */
 
-import {copy} from 'clipboard-js';
 import * as React from 'react';
 import {Fragment, useCallback, useContext} from 'react';
 import {TreeDispatcherContext} from './TreeContext';
-import {BridgeContext, ContextMenuContext, StoreContext} from '../context';
-import ContextMenu from '../../ContextMenu/ContextMenu';
-import ContextMenuItem from '../../ContextMenu/ContextMenuItem';
+import {BridgeContext, StoreContext} from '../context';
 import Button from '../Button';
-import ButtonIcon from '../ButtonIcon';
-import Icon from '../Icon';
-import HocBadges from './HocBadges';
+import InspectedElementBadges from './InspectedElementBadges';
 import InspectedElementContextTree from './InspectedElementContextTree';
+import InspectedElementErrorsAndWarningsTree from './InspectedElementErrorsAndWarningsTree';
 import InspectedElementHooksTree from './InspectedElementHooksTree';
 import InspectedElementPropsTree from './InspectedElementPropsTree';
 import InspectedElementStateTree from './InspectedElementStateTree';
+import InspectedElementStyleXPlugin from './InspectedElementStyleXPlugin';
 import InspectedElementSuspenseToggle from './InspectedElementSuspenseToggle';
 import NativeStyleEditor from './NativeStyleEditor';
-import Badge from './Badge';
-import {useHighlightNativeElement} from '../hooks';
+import ElementBadges from './ElementBadges';
+import {useHighlightHostInstance} from '../hooks';
+import {enableStyleXFeatures} from 'react-devtools-feature-flags';
+import {logEvent} from 'react-devtools-shared/src/Logger';
+import InspectedElementSourcePanel from './InspectedElementSourcePanel';
 
 import styles from './InspectedElementView.css';
 
-import type {ContextMenuContextType} from '../context';
 import type {
-  CopyInspectedElementPath,
-  GetInspectedElementPath,
-  StoreAsGlobal,
-} from './InspectedElementContext';
-import type {Element, InspectedElement, Owner} from './types';
-import type {ElementType} from 'react-devtools-shared/src/types';
+  Element,
+  InspectedElement,
+} from 'react-devtools-shared/src/frontend/types';
+import type {HookNames} from 'react-devtools-shared/src/frontend/types';
+import type {ToggleParseHookNames} from './InspectedElementContext';
+import type {Source} from 'react-devtools-shared/src/shared/types';
 
-export type CopyPath = (path: Array<string | number>) => void;
-export type InspectPath = (path: Array<string | number>) => void;
-
-type Props = {|
-  copyInspectedElementPath: CopyInspectedElementPath,
+type Props = {
   element: Element,
-  getInspectedElementPath: GetInspectedElementPath,
+  hookNames: HookNames | null,
   inspectedElement: InspectedElement,
-  storeAsGlobal: StoreAsGlobal,
-|};
+  parseHookNames: boolean,
+  toggleParseHookNames: ToggleParseHookNames,
+  symbolicatedSourcePromise: Promise<Source | null>,
+};
 
 export default function InspectedElementView({
-  copyInspectedElementPath,
   element,
-  getInspectedElementPath,
+  hookNames,
   inspectedElement,
-  storeAsGlobal,
-}: Props) {
-  const {id} = element;
-  const {
-    owners,
-    rendererPackageName,
-    rendererVersion,
-    rootType,
-    source,
-  } = inspectedElement;
+  parseHookNames,
+  toggleParseHookNames,
+  symbolicatedSourcePromise,
+}: Props): React.Node {
+  const {owners, rendererPackageName, rendererVersion, rootType, source} =
+    inspectedElement;
 
   const bridge = useContext(BridgeContext);
   const store = useContext(StoreContext);
-
-  const {
-    isEnabledForInspectedElement: isContextMenuEnabledForInspectedElement,
-    viewAttributeSourceFunction,
-  } = useContext<ContextMenuContextType>(ContextMenuContext);
 
   const rendererLabel =
     rendererPackageName !== null && rendererVersion !== null
@@ -84,11 +71,16 @@ export default function InspectedElementView({
   return (
     <Fragment>
       <div className={styles.InspectedElement}>
-        <HocBadges element={element} />
+        <div className={styles.InspectedElementBadgesContainer}>
+          <InspectedElementBadges
+            hocDisplayNames={element.hocDisplayNames}
+            compiledWithForget={element.compiledWithForget}
+          />
+        </div>
 
         <InspectedElementPropsTree
           bridge={bridge}
-          getInspectedElementPath={getInspectedElementPath}
+          element={element}
           inspectedElement={inspectedElement}
           store={store}
         />
@@ -101,21 +93,40 @@ export default function InspectedElementView({
 
         <InspectedElementStateTree
           bridge={bridge}
-          getInspectedElementPath={getInspectedElementPath}
+          element={element}
           inspectedElement={inspectedElement}
           store={store}
         />
 
         <InspectedElementHooksTree
           bridge={bridge}
-          getInspectedElementPath={getInspectedElementPath}
+          element={element}
+          hookNames={hookNames}
           inspectedElement={inspectedElement}
+          parseHookNames={parseHookNames}
           store={store}
+          toggleParseHookNames={toggleParseHookNames}
         />
 
         <InspectedElementContextTree
           bridge={bridge}
-          getInspectedElementPath={getInspectedElementPath}
+          element={element}
+          inspectedElement={inspectedElement}
+          store={store}
+        />
+
+        {enableStyleXFeatures && (
+          <InspectedElementStyleXPlugin
+            bridge={bridge}
+            element={element}
+            inspectedElement={inspectedElement}
+            store={store}
+          />
+        )}
+
+        <InspectedElementErrorsAndWarningsTree
+          bridge={bridge}
+          element={element}
           inspectedElement={inspectedElement}
           store={store}
         />
@@ -123,19 +134,24 @@ export default function InspectedElementView({
         <NativeStyleEditor />
 
         {showRenderedBy && (
-          <div className={styles.Owners}>
+          <div
+            className={styles.Owners}
+            data-testname="InspectedElementView-Owners">
             <div className={styles.OwnersHeader}>rendered by</div>
+
             {showOwnersList &&
-              ((owners: any): Array<Owner>).map(owner => (
+              owners?.map(owner => (
                 <OwnerView
                   key={owner.id}
                   displayName={owner.displayName || 'Anonymous'}
                   hocDisplayNames={owner.hocDisplayNames}
+                  compiledWithForget={owner.compiledWithForget}
                   id={owner.id}
                   isInStore={store.containsElement(owner.id)}
                   type={owner.type}
                 />
               ))}
+
             {rootType !== null && (
               <div className={styles.OwnersMetaField}>{rootType}</div>
             )}
@@ -145,124 +161,46 @@ export default function InspectedElementView({
           </div>
         )}
 
-        {source !== null && (
-          <Source fileName={source.fileName} lineNumber={source.lineNumber} />
+        {source != null && (
+          <InspectedElementSourcePanel
+            source={source}
+            symbolicatedSourcePromise={symbolicatedSourcePromise}
+          />
         )}
       </div>
-
-      {isContextMenuEnabledForInspectedElement && (
-        <ContextMenu id="InspectedElement">
-          {data => (
-            <Fragment>
-              <ContextMenuItem
-                onClick={() => copyInspectedElementPath(id, data.path)}
-                title="Copy value to clipboard">
-                <Icon className={styles.ContextMenuIcon} type="copy" /> Copy
-                value to clipboard
-              </ContextMenuItem>
-              <ContextMenuItem
-                onClick={() => storeAsGlobal(id, data.path)}
-                title="Store as global variable">
-                <Icon
-                  className={styles.ContextMenuIcon}
-                  type="store-as-global-variable"
-                />{' '}
-                Store as global variable
-              </ContextMenuItem>
-              {viewAttributeSourceFunction !== null &&
-                data.type === 'function' && (
-                  <ContextMenuItem
-                    onClick={() => viewAttributeSourceFunction(id, data.path)}
-                    title="Go to definition">
-                    <Icon className={styles.ContextMenuIcon} type="code" /> Go
-                    to definition
-                  </ContextMenuItem>
-                )}
-            </Fragment>
-          )}
-        </ContextMenu>
-      )}
     </Fragment>
   );
 }
 
-// This function is based on describeComponentFrame() in packages/shared/ReactComponentStackFrame
-function formatSourceForDisplay(fileName: string, lineNumber: string) {
-  const BEFORE_SLASH_RE = /^(.*)[\\\/]/;
-
-  let nameOnly = fileName.replace(BEFORE_SLASH_RE, '');
-
-  // In DEV, include code for a common special case:
-  // prefer "folder/index.js" instead of just "index.js".
-  if (/^index\./.test(nameOnly)) {
-    const match = fileName.match(BEFORE_SLASH_RE);
-    if (match) {
-      const pathBeforeSlash = match[1];
-      if (pathBeforeSlash) {
-        const folderName = pathBeforeSlash.replace(BEFORE_SLASH_RE, '');
-        nameOnly = folderName + '/' + nameOnly;
-      }
-    }
-  }
-
-  return `${nameOnly}:${lineNumber}`;
-}
-
-type SourceProps = {|
-  fileName: string,
-  lineNumber: string,
-|};
-
-function Source({fileName, lineNumber}: SourceProps) {
-  const handleCopy = () => copy(`${fileName}:${lineNumber}`);
-  return (
-    <div className={styles.Source}>
-      <div className={styles.SourceHeaderRow}>
-        <div className={styles.SourceHeader}>source</div>
-        <Button onClick={handleCopy} title="Copy to clipboard">
-          <ButtonIcon type="copy" />
-        </Button>
-      </div>
-      <div className={styles.SourceOneLiner}>
-        {formatSourceForDisplay(fileName, lineNumber)}
-      </div>
-    </div>
-  );
-}
-
-type OwnerViewProps = {|
+type OwnerViewProps = {
   displayName: string,
   hocDisplayNames: Array<string> | null,
+  compiledWithForget: boolean,
   id: number,
   isInStore: boolean,
-  type: ElementType,
-|};
+};
 
 function OwnerView({
   displayName,
   hocDisplayNames,
+  compiledWithForget,
   id,
   isInStore,
-  type,
 }: OwnerViewProps) {
   const dispatch = useContext(TreeDispatcherContext);
-  const {
-    highlightNativeElement,
-    clearHighlightNativeElement,
-  } = useHighlightNativeElement();
+  const {highlightHostInstance, clearHighlightHostInstance} =
+    useHighlightHostInstance();
 
-  const handleClick = useCallback(
-    () =>
-      dispatch({
-        type: 'SELECT_ELEMENT_BY_ID',
-        payload: id,
-      }),
-    [dispatch, id],
-  );
-
-  const onMouseEnter = () => highlightNativeElement(id);
-
-  const onMouseLeave = clearHighlightNativeElement;
+  const handleClick = useCallback(() => {
+    logEvent({
+      event_name: 'select-element',
+      metadata: {source: 'owner-view'},
+    });
+    dispatch({
+      type: 'SELECT_ELEMENT_BY_ID',
+      payload: id,
+    });
+  }, [dispatch, id]);
 
   return (
     <Button
@@ -270,15 +208,19 @@ function OwnerView({
       className={styles.OwnerButton}
       disabled={!isInStore}
       onClick={handleClick}
-      onMouseEnter={onMouseEnter}
-      onMouseLeave={onMouseLeave}>
+      onMouseEnter={() => highlightHostInstance(id)}
+      onMouseLeave={clearHighlightHostInstance}>
       <span className={styles.OwnerContent}>
         <span
           className={`${styles.Owner} ${isInStore ? '' : styles.NotInStore}`}
           title={displayName}>
           {displayName}
         </span>
-        <Badge hocDisplayNames={hocDisplayNames} type={type} />
+
+        <ElementBadges
+          hocDisplayNames={hocDisplayNames}
+          compiledWithForget={compiledWithForget}
+        />
       </span>
     </Button>
   );

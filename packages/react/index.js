@@ -1,5 +1,5 @@
 /**
- * Copyright (c) Facebook, Inc. and its affiliates.
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
  *
  * This source code is licensed under the MIT license found in the
  * LICENSE file in the root directory of this source tree.
@@ -7,10 +7,7 @@
  * @flow
  */
 
-// Keep in sync with https://github.com/facebook/flow/blob/master/lib/react.js
-export type StatelessFunctionalComponent<
-  P,
-> = React$StatelessFunctionalComponent<P>;
+// Keep in sync with https://github.com/facebook/flow/blob/main/lib/react.js
 export type ComponentType<-P> = React$ComponentType<P>;
 export type AbstractComponent<
   -Config,
@@ -28,61 +25,54 @@ export type ElementConfig<C> = React$ElementConfig<C>;
 export type ElementRef<C> = React$ElementRef<C>;
 export type Config<Props, DefaultProps> = React$Config<Props, DefaultProps>;
 export type ChildrenArray<+T> = $ReadOnlyArray<ChildrenArray<T>> | T;
-export type Interaction = {
-  name: string,
-  timestamp: number,
-  ...
-};
 
 // Export all exports so that they're available in tests.
 // We can't use export * from in Flow for some reason.
 export {
+  __CLIENT_INTERNALS_DO_NOT_USE_OR_WARN_USERS_THEY_CANNOT_UPGRADE,
   Children,
-  createRef,
   Component,
+  Fragment,
+  Profiler,
   PureComponent,
+  StrictMode,
+  Suspense,
+  cloneElement,
   createContext,
+  createElement,
+  createRef,
+  use,
   forwardRef,
+  isValidElement,
   lazy,
   memo,
+  cache,
+  startTransition,
+  unstable_DebugTracingMode,
+  unstable_LegacyHidden,
+  unstable_Activity,
+  unstable_Scope,
+  unstable_SuspenseList,
+  unstable_TracingMarker,
+  unstable_getCacheForType,
+  unstable_useCacheRefresh,
+  useId,
   useCallback,
   useContext,
-  useEffect,
-  useImperativeHandle,
   useDebugValue,
+  useDeferredValue,
+  useEffect,
+  experimental_useEffectEvent,
+  useImperativeHandle,
+  useInsertionEffect,
   useLayoutEffect,
   useMemo,
+  useOptimistic,
+  useSyncExternalStore,
   useReducer,
   useRef,
   useState,
-  useMutableSource,
-  useMutableSource as unstable_useMutableSource,
-  createMutableSource,
-  createMutableSource as unstable_createMutableSource,
-  Fragment,
-  Profiler,
-  unstable_DebugTracingMode,
-  StrictMode,
-  Suspense,
-  createElement,
-  cloneElement,
-  isValidElement,
-  version,
-  __SECRET_INTERNALS_DO_NOT_USE_OR_YOU_WILL_BE_FIRED,
-  createFactory,
   useTransition,
-  useTransition as unstable_useTransition,
-  startTransition,
-  startTransition as unstable_startTransition,
-  useDeferredValue,
-  useDeferredValue as unstable_useDeferredValue,
-  SuspenseList,
-  SuspenseList as unstable_SuspenseList,
-  unstable_LegacyHidden,
-  unstable_createFundamental,
-  unstable_Scope,
-  unstable_useOpaqueIdentifier,
-  unstable_getCacheForType,
-  unstable_Cache,
-  unstable_useCacheRefresh,
-} from './src/React';
+  useActionState,
+  version,
+} from './src/ReactClient';

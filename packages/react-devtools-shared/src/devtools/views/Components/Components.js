@@ -1,5 +1,5 @@
 /**
- * Copyright (c) Facebook, Inc. and its affiliates.
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
  *
  * This source code is licensed under the MIT license found in the
  * LICENSE file in the root directory of this source tree.
@@ -8,16 +8,8 @@
  */
 
 import * as React from 'react';
-import {
-  Fragment,
-  Suspense,
-  useEffect,
-  useLayoutEffect,
-  useReducer,
-  useRef,
-} from 'react';
+import {Fragment, useEffect, useLayoutEffect, useReducer, useRef} from 'react';
 import Tree from './Tree';
-import {InspectedElementContextController} from './InspectedElementContext';
 import {OwnersListContextController} from './OwnersListContext';
 import portaledContent from '../portaledContent';
 import {SettingsModalContextController} from 'react-devtools-shared/src/devtools/views/Settings/SettingsModalContext';
@@ -25,7 +17,9 @@ import {
   localStorageGetItem,
   localStorageSetItem,
 } from 'react-devtools-shared/src/storage';
+import InspectedElementErrorBoundary from './InspectedElementErrorBoundary';
 import InspectedElement from './InspectedElement';
+import {InspectedElementContextController} from './InspectedElementContext';
 import {ModalDialog} from '../ModalDialog';
 import SettingsModal from 'react-devtools-shared/src/devtools/views/Settings/SettingsModal';
 import {NativeStyleContextController} from './NativeStyleEditor/context';
@@ -40,18 +34,18 @@ type ResizeActionType =
   | 'ACTION_SET_HORIZONTAL_PERCENTAGE'
   | 'ACTION_SET_VERTICAL_PERCENTAGE';
 
-type ResizeAction = {|
+type ResizeAction = {
   type: ResizeActionType,
   payload: any,
-|};
+};
 
-type ResizeState = {|
+type ResizeState = {
   horizontalPercentage: number,
   isResizing: boolean,
   verticalPercentage: number,
-|};
+};
 
-function Components(_: {||}) {
+function Components(_: {}) {
   const wrapperElementRef = useRef<null | HTMLElement>(null);
   const resizeElementRef = useRef<null | HTMLElement>(null);
 
@@ -99,6 +93,7 @@ function Components(_: {||}) {
     onResizeEnd = () =>
       dispatch({type: 'ACTION_SET_IS_RESIZING', payload: false});
 
+    // $FlowFixMe[missing-local-annot]
     onResize = event => {
       const resizeElement = resizeElementRef.current;
       const wrapperElement = wrapperElementRef.current;
@@ -151,39 +146,35 @@ function Components(_: {||}) {
   return (
     <SettingsModalContextController>
       <OwnersListContextController>
-        <InspectedElementContextController>
-          <div
-            ref={wrapperElementRef}
-            className={styles.Components}
-            onMouseMove={onResize}
-            onMouseLeave={onResizeEnd}
-            onMouseUp={onResizeEnd}>
-            <Fragment>
-              <div ref={resizeElementRef} className={styles.TreeWrapper}>
-                <Tree />
-              </div>
-              <div className={styles.ResizeBarWrapper}>
-                <div onMouseDown={onResizeStart} className={styles.ResizeBar} />
-              </div>
-              <div className={styles.InspectedElementWrapper}>
-                <NativeStyleContextController>
-                  <Suspense fallback={<Loading />}>
+        <div
+          ref={wrapperElementRef}
+          className={styles.Components}
+          onMouseMove={onResize}
+          onMouseLeave={onResizeEnd}
+          onMouseUp={onResizeEnd}>
+          <Fragment>
+            <div ref={resizeElementRef} className={styles.TreeWrapper}>
+              <Tree />
+            </div>
+            <div className={styles.ResizeBarWrapper}>
+              <div onMouseDown={onResizeStart} className={styles.ResizeBar} />
+            </div>
+            <div className={styles.InspectedElementWrapper}>
+              <NativeStyleContextController>
+                <InspectedElementErrorBoundary>
+                  <InspectedElementContextController>
                     <InspectedElement />
-                  </Suspense>
-                </NativeStyleContextController>
-              </div>
-              <ModalDialog />
-              <SettingsModal />
-            </Fragment>
-          </div>
-        </InspectedElementContextController>
+                  </InspectedElementContextController>
+                </InspectedElementErrorBoundary>
+              </NativeStyleContextController>
+            </div>
+            <ModalDialog />
+            <SettingsModal />
+          </Fragment>
+        </div>
       </OwnersListContextController>
     </SettingsModalContextController>
   );
-}
-
-function Loading() {
-  return <div className={styles.Loading}>Loading...</div>;
 }
 
 const LOCAL_STORAGE_KEY = 'React::DevTools::createResizeReducer';
@@ -255,4 +246,4 @@ function setResizeCSSVariable(
   }
 }
 
-export default portaledContent(Components);
+export default (portaledContent(Components): React$AbstractComponent<{}>);

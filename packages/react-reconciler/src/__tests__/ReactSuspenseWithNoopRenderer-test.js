@@ -2,12 +2,18 @@ let React;
 let Fragment;
 let ReactNoop;
 let Scheduler;
+let act;
+let waitFor;
+let waitForAll;
+let waitForMicrotasks;
+let assertLog;
+let waitForPaint;
 let Suspense;
-let textCache;
+let startTransition;
+let getCacheForType;
 
-let readText;
-let resolveText;
-let rejectText;
+let caches;
+let seededCache;
 
 describe('ReactSuspenseWithNoopRenderer', () => {
   beforeEach(() => {
@@ -17,90 +23,152 @@ describe('ReactSuspenseWithNoopRenderer', () => {
     Fragment = React.Fragment;
     ReactNoop = require('react-noop-renderer');
     Scheduler = require('scheduler');
+    act = require('internal-test-utils').act;
     Suspense = React.Suspense;
+    startTransition = React.startTransition;
+    const InternalTestUtils = require('internal-test-utils');
+    waitFor = InternalTestUtils.waitFor;
+    waitForAll = InternalTestUtils.waitForAll;
+    waitForPaint = InternalTestUtils.waitForPaint;
+    waitForMicrotasks = InternalTestUtils.waitForMicrotasks;
+    assertLog = InternalTestUtils.assertLog;
 
-    textCache = new Map();
+    getCacheForType = React.unstable_getCacheForType;
 
-    readText = text => {
-      const record = textCache.get(text);
-      if (record !== undefined) {
-        switch (record.status) {
-          case 'pending':
-            throw record.promise;
-          case 'rejected':
-            throw Error('Failed to load: ' + text);
-          case 'resolved':
-            return text;
-        }
-      } else {
-        let ping;
-        const promise = new Promise(resolve => (ping = resolve));
-        const newRecord = {
-          status: 'pending',
-          ping: ping,
-          promise,
-        };
-        textCache.set(text, newRecord);
-        throw promise;
-      }
-    };
-
-    resolveText = text => {
-      const record = textCache.get(text);
-      if (record !== undefined) {
-        if (record.status === 'pending') {
-          Scheduler.unstable_yieldValue(`Promise resolved [${text}]`);
-          record.ping();
-          record.ping = null;
-          record.status = 'resolved';
-          clearTimeout(record.promise._timer);
-          record.promise = null;
-        }
-      } else {
-        const newRecord = {
-          ping: null,
-          status: 'resolved',
-          promise: null,
-        };
-        textCache.set(text, newRecord);
-      }
-    };
-
-    rejectText = text => {
-      const record = textCache.get(text);
-      if (record !== undefined) {
-        if (record.status === 'pending') {
-          Scheduler.unstable_yieldValue(`Promise rejected [${text}]`);
-          record.ping();
-          record.status = 'rejected';
-          clearTimeout(record.promise._timer);
-          record.promise = null;
-        }
-      } else {
-        const newRecord = {
-          ping: null,
-          status: 'rejected',
-          promise: null,
-        };
-        textCache.set(text, newRecord);
-      }
-    };
+    caches = [];
+    seededCache = null;
   });
 
-  // function div(...children) {
-  //   children = children.map(
-  //     c => (typeof c === 'string' ? {text: c, hidden: false} : c),
-  //   );
-  //   return {type: 'div', children, prop: undefined, hidden: false};
-  // }
+  function createTextCache() {
+    if (seededCache !== null) {
+      // Trick to seed a cache before it exists.
+      // TODO: Need a built-in API to seed data before the initial render (i.e.
+      // not a refresh because nothing has mounted yet).
+      const cache = seededCache;
+      seededCache = null;
+      return cache;
+    }
 
-  function span(prop) {
-    return {type: 'span', children: [], prop, hidden: false};
+    const data = new Map();
+    const version = caches.length + 1;
+    const cache = {
+      version,
+      data,
+      resolve(text) {
+        const record = data.get(text);
+        if (record === undefined) {
+          const newRecord = {
+            status: 'resolved',
+            value: text,
+          };
+          data.set(text, newRecord);
+        } else if (record.status === 'pending') {
+          const thenable = record.value;
+          record.status = 'resolved';
+          record.value = text;
+          thenable.pings.forEach(t => t());
+        }
+      },
+      reject(text, error) {
+        const record = data.get(text);
+        if (record === undefined) {
+          const newRecord = {
+            status: 'rejected',
+            value: error,
+          };
+          data.set(text, newRecord);
+        } else if (record.status === 'pending') {
+          const thenable = record.value;
+          record.status = 'rejected';
+          record.value = error;
+          thenable.pings.forEach(t => t());
+        }
+      },
+    };
+    caches.push(cache);
+    return cache;
   }
 
-  function hiddenSpan(prop) {
-    return {type: 'span', children: [], prop, hidden: true};
+  function readText(text) {
+    const textCache = getCacheForType(createTextCache);
+    const record = textCache.data.get(text);
+    if (record !== undefined) {
+      switch (record.status) {
+        case 'pending':
+          Scheduler.log(`Suspend! [${text}]`);
+          throw record.value;
+        case 'rejected':
+          Scheduler.log(`Error! [${text}]`);
+          throw record.value;
+        case 'resolved':
+          return textCache.version;
+      }
+    } else {
+      Scheduler.log(`Suspend! [${text}]`);
+
+      const thenable = {
+        pings: [],
+        then(resolve) {
+          if (newRecord.status === 'pending') {
+            thenable.pings.push(resolve);
+          } else {
+            Promise.resolve().then(() => resolve(newRecord.value));
+          }
+        },
+      };
+
+      const newRecord = {
+        status: 'pending',
+        value: thenable,
+      };
+      textCache.data.set(text, newRecord);
+
+      throw thenable;
+    }
   }
+
+  function Text({text}) {
+    Scheduler.log(text);
+    return <span prop={text} />;
+  }
+
+  function AsyncText({text, showVersion}) {
+    const version = readText(text);
+    const fullText = showVersion ? `${text} [v${version}]` : text;
+    Scheduler.log(fullText);
+    return <span prop={fullText} />;
+  }
+
+  function seedNextTextCache(text) {
+    if (seededCache === null) {
+      seededCache = createTextCache();
+    }
+    seededCache.resolve(text);
+  }
+
+  function resolveMostRecentTextCache(text) {
+    if (caches.length === 0) {
+      throw Error('Cache does not exist.');
+    } else {
+      // Resolve the most recently created cache. An older cache can by
+      // resolved with `caches[index].resolve(text)`.
+      caches[caches.length - 1].resolve(text);
+    }
+  }
+
+  const resolveText = resolveMostRecentTextCache;
+
+  function rejectMostRecentTextCache(text, error) {
+    if (caches.length === 0) {
+      throw Error('Cache does not exist.');
+    } else {
+      // Resolve the most recently created cache. An older cache can by
+      // resolved with `caches[index].reject(text, error)`.
+      caches[caches.length - 1].reject(text, error);
+    }
+  }
+
+  const rejectText = rejectMostRecentTextCache;
 
   function advanceTimers(ms) {
     // Note: This advances Jest's virtual time but not React's. Use
@@ -112,32 +180,6 @@ describe('ReactSuspenseWithNoopRenderer', () => {
     // Wait until the end of the current tick
     // We cannot use a timer since we're faking them
     return Promise.resolve().then(() => {});
-  }
-
-  function Text(props) {
-    Scheduler.unstable_yieldValue(props.text);
-    return <span prop={props.text} ref={props.hostRef} />;
-  }
-
-  function AsyncText(props) {
-    const text = props.text;
-    try {
-      readText(text);
-      Scheduler.unstable_yieldValue(text);
-      return <span prop={text} />;
-    } catch (promise) {
-      if (typeof promise.then === 'function') {
-        Scheduler.unstable_yieldValue(`Suspend! [${text}]`);
-        if (typeof props.ms === 'number' && promise._timer === undefined) {
-          promise._timer = setTimeout(() => {
-            resolveText(text);
-          }, props.ms);
-        }
-      } else {
-        Scheduler.unstable_yieldValue(`Error! [${text}]`);
-      }
-      throw promise;
-    }
   }
 
   // Note: This is based on a similar component we use in www. We can delete
@@ -153,19 +195,20 @@ describe('ReactSuspenseWithNoopRenderer', () => {
     );
   }
 
-  it('does not restart rendering for initial render', async () => {
+  // @gate enableLegacyCache
+  it("does not restart if there's a ping during initial render", async () => {
     function Bar(props) {
-      Scheduler.unstable_yieldValue('Bar');
+      Scheduler.log('Bar');
       return props.children;
     }
 
     function Foo() {
-      Scheduler.unstable_yieldValue('Foo');
+      Scheduler.log('Foo');
       return (
         <>
           <Suspense fallback={<Text text="Loading..." />}>
             <Bar>
-              <AsyncText text="A" ms={100} />
+              <AsyncText text="A" />
               <Text text="B" />
             </Bar>
           </Suspense>
@@ -175,61 +218,63 @@ describe('ReactSuspenseWithNoopRenderer', () => {
       );
     }
 
-    ReactNoop.render(<Foo />);
-    expect(Scheduler).toFlushAndYieldThrough([
+    React.startTransition(() => {
+      ReactNoop.render(<Foo />);
+    });
+    await waitFor([
       'Foo',
       'Bar',
       // A suspends
       'Suspend! [A]',
-      // But we keep rendering the siblings
-      'B',
+      // We immediately unwind and switch to a fallback without
+      // rendering siblings.
       'Loading...',
       'C',
-      // We leave D incomplete.
+      // Yield before rendering D
     ]);
-    expect(ReactNoop.getChildren()).toEqual([]);
+    expect(ReactNoop).toMatchRenderedOutput(null);
 
     // Flush the promise completely
-    Scheduler.unstable_advanceTime(100);
-    await advanceTimers(100);
-    expect(Scheduler).toHaveYielded(['Promise resolved [A]']);
+    await act(async () => {
+      await resolveText('A');
+      // Even though the promise has resolved, we should now flush
+      // and commit the in progress render instead of restarting.
+      await waitForPaint(['D']);
+      expect(ReactNoop).toMatchRenderedOutput(
+        <>
+          <span prop="Loading..." />
+          <span prop="C" />
+          <span prop="D" />
+        </>,
+      );
+      // Next, we'll flush the complete content.
+      await waitForAll(['Bar', 'A', 'B']);
+    });
 
-    // Even though the promise has resolved, we should now flush
-    // and commit the in progress render instead of restarting.
-    expect(Scheduler).toFlushAndYield(['D']);
-    expect(ReactNoop.getChildren()).toEqual([
-      span('Loading...'),
-      span('C'),
-      span('D'),
-    ]);
-
-    // Await one micro task to attach the retry listeners.
-    await null;
-
-    // Next, we'll flush the complete content.
-    expect(Scheduler).toFlushAndYield(['Bar', 'A', 'B']);
-
-    expect(ReactNoop.getChildren()).toEqual([
-      span('A'),
-      span('B'),
-      span('C'),
-      span('D'),
-    ]);
+    expect(ReactNoop).toMatchRenderedOutput(
+      <>
+        <span prop="A" />
+        <span prop="B" />
+        <span prop="C" />
+        <span prop="D" />
+      </>,
+    );
   });
 
+  // @gate enableLegacyCache
   it('suspends rendering and continues later', async () => {
     function Bar(props) {
-      Scheduler.unstable_yieldValue('Bar');
+      Scheduler.log('Bar');
       return props.children;
     }
 
     function Foo({renderBar}) {
-      Scheduler.unstable_yieldValue('Foo');
+      Scheduler.log('Foo');
       return (
         <Suspense fallback={<Text text="Loading..." />}>
           {renderBar ? (
             <Bar>
-              <AsyncText text="A" ms={100} />
+              <AsyncText text="A" />
               <Text text="B" />
             </Bar>
           ) : null}
@@ -239,118 +284,121 @@ describe('ReactSuspenseWithNoopRenderer', () => {
 
     // Render empty shell.
     ReactNoop.render(<Foo />);
-    expect(Scheduler).toFlushAndYield(['Foo']);
+    await waitForAll(['Foo']);
 
     // The update will suspend.
-    ReactNoop.render(<Foo renderBar={true} />);
-    expect(Scheduler).toFlushAndYield([
+    React.startTransition(() => {
+      ReactNoop.render(<Foo renderBar={true} />);
+    });
+    await waitForAll([
       'Foo',
       'Bar',
       // A suspends
       'Suspend! [A]',
-      // But we keep rendering the siblings
-      'B',
+      // We immediately unwind and switch to a fallback without
+      // rendering siblings.
       'Loading...',
     ]);
-    expect(ReactNoop.getChildren()).toEqual([]);
+    expect(ReactNoop).toMatchRenderedOutput(null);
 
-    // Flush some of the time
-    await advanceTimers(50);
-    // Still nothing...
-    expect(Scheduler).toFlushWithoutYielding();
-    expect(ReactNoop.getChildren()).toEqual([]);
-
-    // Flush the promise completely
-    await advanceTimers(50);
+    // Resolve the data
+    await resolveText('A');
     // Renders successfully
-    expect(Scheduler).toHaveYielded(['Promise resolved [A]']);
-    expect(Scheduler).toFlushAndYield(['Foo', 'Bar', 'A', 'B']);
-    expect(ReactNoop.getChildren()).toEqual([span('A'), span('B')]);
+    await waitForAll(['Foo', 'Bar', 'A', 'B']);
+    expect(ReactNoop).toMatchRenderedOutput(
+      <>
+        <span prop="A" />
+        <span prop="B" />
+      </>,
+    );
   });
 
+  // @gate enableLegacyCache
   it('suspends siblings and later recovers each independently', async () => {
     // Render two sibling Suspense components
     ReactNoop.render(
       <Fragment>
         <Suspense fallback={<Text text="Loading A..." />}>
-          <AsyncText text="A" ms={5000} />
+          <AsyncText text="A" />
         </Suspense>
         <Suspense fallback={<Text text="Loading B..." />}>
-          <AsyncText text="B" ms={6000} />
+          <AsyncText text="B" />
         </Suspense>
       </Fragment>,
     );
-    expect(Scheduler).toFlushAndYield([
+    await waitForAll([
       'Suspend! [A]',
       'Loading A...',
       'Suspend! [B]',
       'Loading B...',
     ]);
-    expect(ReactNoop.getChildren()).toEqual([
-      span('Loading A...'),
-      span('Loading B...'),
-    ]);
+    expect(ReactNoop).toMatchRenderedOutput(
+      <>
+        <span prop="Loading A..." />
+        <span prop="Loading B..." />
+      </>,
+    );
 
-    // Advance time by enough that the first Suspense's promise resolves and
-    // switches back to the normal view. The second Suspense should still
-    // show the placeholder
-    ReactNoop.expire(5000);
-    await advanceTimers(5000);
+    // Resolve first Suspense's promise so that it switches switches back to the
+    // normal view. The second Suspense should still show the placeholder.
+    await act(() => resolveText('A'));
+    assertLog(['A']);
+    expect(ReactNoop).toMatchRenderedOutput(
+      <>
+        <span prop="A" />
+        <span prop="Loading B..." />
+      </>,
+    );
 
-    expect(Scheduler).toHaveYielded(['Promise resolved [A]']);
-    expect(Scheduler).toFlushAndYield(['A']);
-    expect(ReactNoop.getChildren()).toEqual([span('A'), span('Loading B...')]);
-
-    // Advance time by enough that the second Suspense's promise resolves
-    // and switches back to the normal view
-    ReactNoop.expire(1000);
-    await advanceTimers(1000);
-
-    expect(Scheduler).toHaveYielded(['Promise resolved [B]']);
-    expect(Scheduler).toFlushAndYield(['B']);
-    expect(ReactNoop.getChildren()).toEqual([span('A'), span('B')]);
+    // Resolve the second Suspense's promise so that it switches back to the
+    // normal view.
+    await act(() => resolveText('B'));
+    assertLog(['B']);
+    expect(ReactNoop).toMatchRenderedOutput(
+      <>
+        <span prop="A" />
+        <span prop="B" />
+      </>,
+    );
   });
 
-  it('continues rendering siblings after suspending', async () => {
+  // @gate enableLegacyCache
+  it('when something suspends, unwinds immediately without rendering siblings', async () => {
     // A shell is needed. The update cause it to suspend.
     ReactNoop.render(<Suspense fallback={<Text text="Loading..." />} />);
-    expect(Scheduler).toFlushAndYield([]);
-    // B suspends. Continue rendering the remaining siblings.
-    ReactNoop.render(
-      <Suspense fallback={<Text text="Loading..." />}>
-        <Text text="A" />
-        <AsyncText text="B" />
-        <Text text="C" />
-        <Text text="D" />
-      </Suspense>,
-    );
-    // B suspends. Continue rendering the remaining siblings.
-    expect(Scheduler).toFlushAndYield([
-      'A',
-      'Suspend! [B]',
-      'C',
-      'D',
-      'Loading...',
-    ]);
+    await waitForAll([]);
+    React.startTransition(() => {
+      ReactNoop.render(
+        <Suspense fallback={<Text text="Loading..." />}>
+          <Text text="A" />
+          <AsyncText text="B" />
+          <Text text="C" />
+          <Text text="D" />
+        </Suspense>,
+      );
+    });
+
+    // B suspends. Render a fallback
+    await waitForAll(['A', 'Suspend! [B]', 'Loading...']);
     // Did not commit yet.
-    expect(ReactNoop.getChildren()).toEqual([]);
+    expect(ReactNoop).toMatchRenderedOutput(null);
 
     // Wait for data to resolve
     await resolveText('B');
+    await waitForAll(['A', 'B', 'C', 'D']);
     // Renders successfully
-    expect(Scheduler).toHaveYielded(['Promise resolved [B]']);
-    expect(Scheduler).toFlushAndYield(['A', 'B', 'C', 'D']);
-    expect(ReactNoop.getChildren()).toEqual([
-      span('A'),
-      span('B'),
-      span('C'),
-      span('D'),
-    ]);
+    expect(ReactNoop).toMatchRenderedOutput(
+      <>
+        <span prop="A" />
+        <span prop="B" />
+        <span prop="C" />
+        <span prop="D" />
+      </>,
+    );
   });
 
   // Second condition is redundant but guarantees that the test runs in prod.
-  // TODO: Delete this feature flag.
-  // @gate !replayFailedUnitOfWorkWithInvokeGuardedCallback || !__DEV__
+  // @gate enableLegacyCache
   it('retries on error', async () => {
     class ErrorBoundary extends React.Component {
       state = {error: null};
@@ -374,7 +422,7 @@ describe('ReactSuspenseWithNoopRenderer', () => {
         <Suspense fallback={<Text text="Loading..." />}>
           {renderContent ? (
             <ErrorBoundary ref={errorBoundary}>
-              <AsyncText text="Result" ms={1000} />
+              <AsyncText text="Result" />
             </ErrorBoundary>
           ) : null}
         </Suspense>
@@ -382,18 +430,18 @@ describe('ReactSuspenseWithNoopRenderer', () => {
     }
 
     ReactNoop.render(<App />);
-    expect(Scheduler).toFlushAndYield([]);
-    expect(ReactNoop.getChildren()).toEqual([]);
+    await waitForAll([]);
+    expect(ReactNoop).toMatchRenderedOutput(null);
 
-    ReactNoop.render(<App renderContent={true} />);
-    expect(Scheduler).toFlushAndYield(['Suspend! [Result]', 'Loading...']);
-    expect(ReactNoop.getChildren()).toEqual([]);
+    React.startTransition(() => {
+      ReactNoop.render(<App renderContent={true} />);
+    });
+    await waitForAll(['Suspend! [Result]', 'Loading...']);
+    expect(ReactNoop).toMatchRenderedOutput(null);
 
-    await rejectText('Result');
+    await rejectText('Result', new Error('Failed to load: Result'));
 
-    expect(Scheduler).toHaveYielded(['Promise rejected [Result]']);
-
-    expect(Scheduler).toFlushAndYield([
+    await waitForAll([
       'Error! [Result]',
 
       // React retries one more time
@@ -402,14 +450,13 @@ describe('ReactSuspenseWithNoopRenderer', () => {
       // Errored again on retry. Now handle it.
       'Caught error: Failed to load: Result',
     ]);
-    expect(ReactNoop.getChildren()).toEqual([
-      span('Caught error: Failed to load: Result'),
-    ]);
+    expect(ReactNoop).toMatchRenderedOutput(
+      <span prop="Caught error: Failed to load: Result" />,
+    );
   });
 
   // Second condition is redundant but guarantees that the test runs in prod.
-  // TODO: Delete this feature flag.
-  // @gate !replayFailedUnitOfWorkWithInvokeGuardedCallback || !__DEV__
+  // @gate enableLegacyCache
   it('retries on error after falling back to a placeholder', async () => {
     class ErrorBoundary extends React.Component {
       state = {error: null};
@@ -432,79 +479,103 @@ describe('ReactSuspenseWithNoopRenderer', () => {
       return (
         <Suspense fallback={<Text text="Loading..." />}>
           <ErrorBoundary ref={errorBoundary}>
-            <AsyncText text="Result" ms={3000} />
+            <AsyncText text="Result" />
           </ErrorBoundary>
         </Suspense>
       );
     }
 
     ReactNoop.render(<App />);
-    expect(Scheduler).toFlushAndYield(['Suspend! [Result]', 'Loading...']);
-    expect(ReactNoop.getChildren()).toEqual([span('Loading...')]);
+    await waitForAll(['Suspend! [Result]', 'Loading...']);
+    expect(ReactNoop).toMatchRenderedOutput(<span prop="Loading..." />);
 
-    await rejectText('Result');
-
-    expect(Scheduler).toHaveYielded(['Promise rejected [Result]']);
-    expect(Scheduler).toFlushAndYield([
+    await act(() => rejectText('Result', new Error('Failed to load: Result')));
+    assertLog([
       'Error! [Result]',
 
       // React retries one more time
       'Error! [Result]',
 
       // Errored again on retry. Now handle it.
-
       'Caught error: Failed to load: Result',
     ]);
-    expect(ReactNoop.getChildren()).toEqual([
-      span('Caught error: Failed to load: Result'),
-    ]);
+    expect(ReactNoop).toMatchRenderedOutput(
+      <span prop="Caught error: Failed to load: Result" />,
+    );
   });
 
+  // @gate enableLegacyCache
   it('can update at a higher priority while in a suspended state', async () => {
-    function App(props) {
+    let setHighPri;
+    function HighPri() {
+      const [text, setText] = React.useState('A');
+      setHighPri = setText;
+      return <Text text={text} />;
+    }
+
+    let setLowPri;
+    function LowPri() {
+      const [text, setText] = React.useState('1');
+      setLowPri = setText;
+      return <AsyncText text={text} />;
+    }
+
+    function App() {
       return (
-        <Suspense fallback={<Text text="Loading..." />}>
-          <Text text={props.highPri} />
-          <AsyncText text={props.lowPri} />
-        </Suspense>
+        <>
+          <HighPri />
+          <Suspense fallback={<Text text="Loading..." />}>
+            <LowPri />
+          </Suspense>
+        </>
       );
     }
 
     // Initial mount
-    ReactNoop.render(<App highPri="A" lowPri="1" />);
-    expect(Scheduler).toFlushAndYield(['A', 'Suspend! [1]', 'Loading...']);
-    await resolveText('1');
-    expect(Scheduler).toHaveYielded(['Promise resolved [1]']);
-    expect(Scheduler).toFlushAndYield(['A', '1']);
-    expect(ReactNoop.getChildren()).toEqual([span('A'), span('1')]);
+    await act(() => ReactNoop.render(<App />));
+    assertLog(['A', 'Suspend! [1]', 'Loading...']);
+
+    await act(() => resolveText('1'));
+    assertLog(['1']);
+    expect(ReactNoop).toMatchRenderedOutput(
+      <>
+        <span prop="A" />
+        <span prop="1" />
+      </>,
+    );
 
     // Update the low-pri text
-    ReactNoop.render(<App highPri="A" lowPri="2" />);
-    expect(Scheduler).toFlushAndYield([
-      'A',
-      // Suspends
-      'Suspend! [2]',
-      'Loading...',
-    ]);
+    await act(() => startTransition(() => setLowPri('2')));
+    // Suspends
+    assertLog(['Suspend! [2]', 'Loading...']);
 
     // While we're still waiting for the low-pri update to complete, update the
     // high-pri text at high priority.
     ReactNoop.flushSync(() => {
-      ReactNoop.render(<App highPri="B" lowPri="1" />);
+      setHighPri('B');
     });
-    expect(Scheduler).toHaveYielded(['B', '1']);
-    expect(ReactNoop.getChildren()).toEqual([span('B'), span('1')]);
+    assertLog(['B']);
+    expect(ReactNoop).toMatchRenderedOutput(
+      <>
+        <span prop="B" />
+        <span prop="1" />
+      </>,
+    );
 
-    // Unblock the low-pri text and finish
-    await resolveText('2');
-    expect(Scheduler).toHaveYielded(['Promise resolved [2]']);
-    expect(ReactNoop.getChildren()).toEqual([span('B'), span('1')]);
+    // Unblock the low-pri text and finish. Nothing in the UI changes because
+    // the update was overriden
+    await act(() => resolveText('2'));
+    assertLog(['2']);
+    expect(ReactNoop).toMatchRenderedOutput(
+      <>
+        <span prop="B" />
+        <span prop="2" />
+      </>,
+    );
   });
 
+  // @gate enableLegacyCache
   it('keeps working on lower priority work after being pinged', async () => {
-    // Advance the virtual time so that we're close to the edge of a bucket.
-    ReactNoop.expire(149);
-
     function App(props) {
       return (
         <Suspense fallback={<Text text="Loading..." />}>
@@ -515,26 +586,32 @@ describe('ReactSuspenseWithNoopRenderer', () => {
     }
 
     ReactNoop.render(<App showA={false} showB={false} />);
-    expect(Scheduler).toFlushAndYield([]);
-    expect(ReactNoop.getChildren()).toEqual([]);
+    await waitForAll([]);
+    expect(ReactNoop).toMatchRenderedOutput(null);
 
-    ReactNoop.render(<App showA={true} showB={false} />);
-    expect(Scheduler).toFlushAndYield(['Suspend! [A]', 'Loading...']);
-    expect(ReactNoop.getChildren()).toEqual([]);
+    React.startTransition(() => {
+      ReactNoop.render(<App showA={true} showB={false} />);
+    });
+    await waitForAll(['Suspend! [A]', 'Loading...']);
+    expect(ReactNoop).toMatchRenderedOutput(null);
 
-    // Advance React's virtual time by enough to fall into a new async bucket,
-    // but not enough to expire the suspense timeout.
-    ReactNoop.expire(120);
-    ReactNoop.render(<App showA={true} showB={true} />);
-    expect(Scheduler).toFlushAndYield(['Suspend! [A]', 'B', 'Loading...']);
-    expect(ReactNoop.getChildren()).toEqual([]);
+    React.startTransition(() => {
+      ReactNoop.render(<App showA={true} showB={true} />);
+    });
+    await waitForAll(['Suspend! [A]', 'Loading...']);
+    expect(ReactNoop).toMatchRenderedOutput(null);
 
     await resolveText('A');
-    expect(Scheduler).toHaveYielded(['Promise resolved [A]']);
-    expect(Scheduler).toFlushAndYield(['A', 'B']);
-    expect(ReactNoop.getChildren()).toEqual([span('A'), span('B')]);
+    await waitForAll(['A', 'B']);
+    expect(ReactNoop).toMatchRenderedOutput(
+      <>
+        <span prop="A" />
+        <span prop="B" />
+      </>,
+    );
   });
 
+  // @gate enableLegacyCache
   it('tries rendering a lower priority pending update even if a higher priority one suspends', async () => {
     function App(props) {
       if (props.hide) {
@@ -542,31 +619,32 @@ describe('ReactSuspenseWithNoopRenderer', () => {
       }
       return (
         <Suspense fallback="Loading...">
-          <AsyncText ms={2000} text="Async" />
+          <AsyncText text="Async" />
         </Suspense>
       );
     }
 
-    // Schedule a high pri update and a low pri update, without rendering in
-    // between.
-    ReactNoop.discreteUpdates(() => {
-      // High pri
-      ReactNoop.render(<App />);
-    });
+    // Schedule a default pri update and a low pri update, without rendering in between.
+    // Default pri
+    ReactNoop.render(<App />);
     // Low pri
-    ReactNoop.render(<App hide={true} />);
+    React.startTransition(() => {
+      ReactNoop.render(<App hide={true} />);
+    });
 
-    expect(Scheduler).toFlushAndYield([
+    await waitForAll([
       // The first update suspends
       'Suspend! [Async]',
       // but we have another pending update that we can work on
       '(empty)',
     ]);
-    expect(ReactNoop.getChildren()).toEqual([span('(empty)')]);
+    expect(ReactNoop).toMatchRenderedOutput(<span prop="(empty)" />);
   });
 
   // Note: This test was written to test a heuristic used in the expiration
   // times model. Might not make sense in the new model.
+  // TODO: This test doesn't over what it was originally designed to test.
+  // Either rewrite or delete.
   it('tries each subsequent level after suspending', async () => {
     const root = ReactNoop.createRoot();
 
@@ -593,96 +671,42 @@ describe('ReactSuspenseWithNoopRenderer', () => {
 
     // Mount the Suspense boundary without suspending, so that the subsequent
     // updates suspend with a delay.
-    await ReactNoop.act(async () => {
+    await act(() => {
       root.render(<App step={0} shouldSuspend={false} />);
     });
     await advanceTimers(1000);
-    expect(Scheduler).toHaveYielded(['Sibling', 'Step 0']);
+    assertLog(['Sibling', 'Step 0']);
 
     // Schedule an update at several distinct expiration times
-    await ReactNoop.act(async () => {
-      root.render(<App step={1} shouldSuspend={true} />);
+    await act(async () => {
+      React.startTransition(() => {
+        root.render(<App step={1} shouldSuspend={true} />);
+      });
       Scheduler.unstable_advanceTime(1000);
-      expect(Scheduler).toFlushAndYieldThrough(['Sibling']);
+      await waitFor(['Sibling']);
       interrupt();
 
-      root.render(<App step={2} shouldSuspend={true} />);
+      React.startTransition(() => {
+        root.render(<App step={2} shouldSuspend={true} />);
+      });
       Scheduler.unstable_advanceTime(1000);
-      expect(Scheduler).toFlushAndYieldThrough(['Sibling']);
+      await waitFor(['Sibling']);
       interrupt();
 
-      root.render(<App step={3} shouldSuspend={true} />);
+      React.startTransition(() => {
+        root.render(<App step={3} shouldSuspend={true} />);
+      });
       Scheduler.unstable_advanceTime(1000);
-      expect(Scheduler).toFlushAndYieldThrough(['Sibling']);
+      await waitFor(['Sibling']);
       interrupt();
 
       root.render(<App step={4} shouldSuspend={false} />);
     });
 
-    expect(Scheduler).toHaveYielded([
-      // The new reconciler batches everything together, so it finishes without
-      // suspending again.
-      'Sibling',
-
-      // NOTE: The final of the update got pushed into a lower priority range of
-      // lanes, leading to the extra intermediate render. This is because when
-      // we schedule the fourth update, we're already in the middle of rendering
-      // the three others. Since there are only three lanes in the default
-      // range, the fourth lane is shifted to slightly lower priority. This
-      // could easily change when we tweak our batching heuristics. Ideally,
-      // they'd all have default priority and render in a single batch.
-      'Suspend! [Step 3]',
-      'Sibling',
-
-      'Step 4',
-    ]);
+    assertLog(['Sibling', 'Step 4']);
   });
 
-  it('forces an expiration after an update times out', async () => {
-    ReactNoop.render(
-      <Fragment>
-        <Suspense fallback={<Text text="Loading..." />} />
-      </Fragment>,
-    );
-    expect(Scheduler).toFlushAndYield([]);
-
-    ReactNoop.render(
-      <Fragment>
-        <Suspense fallback={<Text text="Loading..." />}>
-          <AsyncText text="Async" ms={20000} />
-        </Suspense>
-        <Text text="Sync" />
-      </Fragment>,
-    );
-
-    expect(Scheduler).toFlushAndYield([
-      // The async child suspends
-      'Suspend! [Async]',
-      // Render the placeholder
-      'Loading...',
-      // Continue on the sibling
-      'Sync',
-    ]);
-    // The update hasn't expired yet, so we commit nothing.
-    expect(ReactNoop.getChildren()).toEqual([]);
-
-    // Advance both React's virtual time and Jest's timers by enough to expire
-    // the update, but not by enough to flush the suspending promise.
-    ReactNoop.expire(10000);
-    await advanceTimers(10000);
-    // No additional rendering work is required, since we already prepared
-    // the placeholder.
-    expect(Scheduler).toHaveYielded([]);
-    // Should have committed the placeholder.
-    expect(ReactNoop.getChildren()).toEqual([span('Loading...'), span('Sync')]);
-
-    // Once the promise resolves, we render the suspended view
-    await advanceTimers(10000);
-    expect(Scheduler).toHaveYielded(['Promise resolved [Async]']);
-    expect(Scheduler).toFlushAndYield(['Async']);
-    expect(ReactNoop.getChildren()).toEqual([span('Async'), span('Sync')]);
-  });
-
+  // @gate enableLegacyCache
   it('switches to an inner fallback after suspending for a while', async () => {
     // Advance the virtual time so that we're closer to the edge of a bucket.
     ReactNoop.expire(200);
@@ -691,67 +715,70 @@ describe('ReactSuspenseWithNoopRenderer', () => {
       <Fragment>
         <Text text="Sync" />
         <Suspense fallback={<Text text="Loading outer..." />}>
-          <AsyncText text="Outer content" ms={300} />
+          <AsyncText text="Outer content" />
           <Suspense fallback={<Text text="Loading inner..." />}>
-            <AsyncText text="Inner content" ms={1000} />
+            <AsyncText text="Inner content" />
           </Suspense>
         </Suspense>
       </Fragment>,
     );
 
-    expect(Scheduler).toFlushAndYield([
+    await waitForAll([
       'Sync',
       // The async content suspends
       'Suspend! [Outer content]',
-      'Suspend! [Inner content]',
-      'Loading inner...',
       'Loading outer...',
     ]);
     // The outer loading state finishes immediately.
-    expect(ReactNoop.getChildren()).toEqual([
-      span('Sync'),
-      span('Loading outer...'),
-    ]);
+    expect(ReactNoop).toMatchRenderedOutput(
+      <>
+        <span prop="Sync" />
+        <span prop="Loading outer..." />
+      </>,
+    );
 
     // Resolve the outer promise.
-    ReactNoop.expire(300);
-    await advanceTimers(300);
-    expect(Scheduler).toHaveYielded(['Promise resolved [Outer content]']);
-    expect(Scheduler).toFlushAndYield([
+    await resolveText('Outer content');
+    await waitForAll([
       'Outer content',
       'Suspend! [Inner content]',
       'Loading inner...',
     ]);
     // Don't commit the inner placeholder yet.
-    expect(ReactNoop.getChildren()).toEqual([
-      span('Sync'),
-      span('Loading outer...'),
-    ]);
+    expect(ReactNoop).toMatchRenderedOutput(
+      <>
+        <span prop="Sync" />
+        <span prop="Loading outer..." />
+      </>,
+    );
 
     // Expire the inner timeout.
     ReactNoop.expire(500);
     await advanceTimers(500);
     // Now that 750ms have elapsed since the outer placeholder timed out,
     // we can timeout the inner placeholder.
-    expect(ReactNoop.getChildren()).toEqual([
-      span('Sync'),
-      span('Outer content'),
-      span('Loading inner...'),
-    ]);
+    expect(ReactNoop).toMatchRenderedOutput(
+      <>
+        <span prop="Sync" />
+        <span prop="Outer content" />
+        <span prop="Loading inner..." />
+      </>,
+    );
 
     // Finally, flush the inner promise. We should see the complete screen.
-    ReactNoop.expire(1000);
-    await advanceTimers(1000);
-    expect(Scheduler).toHaveYielded(['Promise resolved [Inner content]']);
-    expect(Scheduler).toFlushAndYield(['Inner content']);
-    expect(ReactNoop.getChildren()).toEqual([
-      span('Sync'),
-      span('Outer content'),
-      span('Inner content'),
-    ]);
+    await act(() => resolveText('Inner content'));
+    assertLog(['Inner content']);
+    expect(ReactNoop).toMatchRenderedOutput(
+      <>
+        <span prop="Sync" />
+        <span prop="Outer content" />
+        <span prop="Inner content" />
+      </>,
+    );
   });
 
-  it('renders an expiration boundary synchronously', async () => {
+  // @gate enableLegacyCache
+  it('renders an Suspense boundary synchronously', async () => {
     spyOnDev(console, 'error');
     // Synchronously render a tree that suspends
     ReactNoop.flushSync(() =>
@@ -764,7 +791,7 @@ describe('ReactSuspenseWithNoopRenderer', () => {
         </Fragment>,
       ),
     );
-    expect(Scheduler).toHaveYielded([
+    assertLog([
       // The async child suspends
       'Suspend! [Async]',
       // We immediately render the fallback UI
@@ -773,15 +800,25 @@ describe('ReactSuspenseWithNoopRenderer', () => {
       'Sync',
     ]);
     // The tree commits synchronously
-    expect(ReactNoop.getChildren()).toEqual([span('Loading...'), span('Sync')]);
+    expect(ReactNoop).toMatchRenderedOutput(
+      <>
+        <span prop="Loading..." />
+        <span prop="Sync" />
+      </>,
+    );
 
     // Once the promise resolves, we render the suspended view
-    await resolveText('Async');
-    expect(Scheduler).toHaveYielded(['Promise resolved [Async]']);
-    expect(Scheduler).toFlushAndYield(['Async']);
-    expect(ReactNoop.getChildren()).toEqual([span('Async'), span('Sync')]);
+    await act(() => resolveText('Async'));
+    assertLog(['Async']);
+    expect(ReactNoop).toMatchRenderedOutput(
+      <>
+        <span prop="Async" />
+        <span prop="Sync" />
+      </>,
+    );
   });
 
+  // @gate enableLegacyCache
   it('suspending inside an expired expiration boundary will bubble to the next one', async () => {
     ReactNoop.flushSync(() =>
       ReactNoop.render(
@@ -795,151 +832,117 @@ describe('ReactSuspenseWithNoopRenderer', () => {
         </Fragment>,
       ),
     );
-    expect(Scheduler).toHaveYielded([
+    assertLog([
       'Suspend! [Async]',
       'Suspend! [Loading (inner)...]',
-      'Sync',
       'Loading (outer)...',
     ]);
     // The tree commits synchronously
-    expect(ReactNoop.getChildren()).toEqual([span('Loading (outer)...')]);
+    expect(ReactNoop).toMatchRenderedOutput(<span prop="Loading (outer)..." />);
   });
 
-  it('expires early by default', async () => {
-    ReactNoop.render(
-      <Fragment>
-        <Suspense fallback={<Text text="Loading..." />} />
-      </Fragment>,
-    );
-    expect(Scheduler).toFlushAndYield([]);
-
-    ReactNoop.render(
-      <Fragment>
-        <Suspense fallback={<Text text="Loading..." />}>
-          <AsyncText text="Async" ms={3000} />
-        </Suspense>
-        <Text text="Sync" />
-      </Fragment>,
-    );
-
-    expect(Scheduler).toFlushAndYield([
-      // The async child suspends
-      'Suspend! [Async]',
-      'Loading...',
-      // Continue on the sibling
-      'Sync',
-    ]);
-    // The update hasn't expired yet, so we commit nothing.
-    expect(ReactNoop.getChildren()).toEqual([]);
-
-    // Advance both React's virtual time and Jest's timers by enough to trigger
-    // the timeout, but not by enough to flush the promise or reach the true
-    // expiration time.
-    ReactNoop.expire(2000);
-    await advanceTimers(2000);
-    expect(Scheduler).toFlushWithoutYielding();
-    expect(ReactNoop.getChildren()).toEqual([span('Loading...'), span('Sync')]);
-
-    // Once the promise resolves, we render the suspended view
-    await advanceTimers(1000);
-    expect(Scheduler).toHaveYielded(['Promise resolved [Async]']);
-    expect(Scheduler).toFlushAndYield(['Async']);
-    expect(ReactNoop.getChildren()).toEqual([span('Async'), span('Sync')]);
-  });
-
+  // @gate enableLegacyCache
   it('resolves successfully even if fallback render is pending', async () => {
-    ReactNoop.render(
+    const root = ReactNoop.createRoot();
+    root.render(
       <>
         <Suspense fallback={<Text text="Loading..." />} />
       </>,
     );
-    expect(Scheduler).toFlushAndYield([]);
-    expect(ReactNoop.getChildren()).toEqual([]);
-    ReactNoop.render(
+    await waitForAll([]);
+    expect(root).toMatchRenderedOutput(null);
+    React.startTransition(() => {
+      root.render(
+        <>
+          <Suspense fallback={<Text text="Loading..." />}>
+            <AsyncText text="Async" />
+            <Text text="Sibling" />
+          </Suspense>
+        </>,
+      );
+    });
+    await waitFor(['Suspend! [Async]']);
+
+    await resolveText('Async');
+
+    // Because we're already showing a fallback, interrupt the current render
+    // and restart immediately.
+    await waitForAll(['Async', 'Sibling']);
+    expect(root).toMatchRenderedOutput(
       <>
-        <Suspense fallback={<Text text="Loading..." />}>
-          <AsyncText text="Async" ms={3000} />
-        </Suspense>
+        <span prop="Async" />
+        <span prop="Sibling" />
       </>,
     );
-    expect(ReactNoop.flushNextYield()).toEqual(['Suspend! [Async]']);
-    await advanceTimers(1500);
-    expect(Scheduler).toHaveYielded([]);
-    expect(ReactNoop.getChildren()).toEqual([]);
-    // Before we have a chance to flush, the promise resolves.
-    await advanceTimers(2000);
-    expect(Scheduler).toHaveYielded(['Promise resolved [Async]']);
-    expect(Scheduler).toFlushAndYield([
-      // We've now pinged the boundary but we don't know if we should restart yet,
-      // because we haven't completed the suspense boundary.
-      'Loading...',
-      // Once we've completed the boundary we restarted.
-      'Async',
-    ]);
-    expect(ReactNoop.getChildren()).toEqual([span('Async')]);
   });
 
-  it('throws a helpful error when an update is suspends without a placeholder', () => {
-    ReactNoop.render(<AsyncText ms={1000} text="Async" />);
-    expect(Scheduler).toFlushAndThrow(
-      'AsyncText suspended while rendering, but no fallback UI was specified.',
+  // @gate enableLegacyCache
+  it('in concurrent mode, does not error when an update suspends without a Suspense boundary during a sync update', () => {
+    // NOTE: We may change this to be a warning in the future.
+    expect(() => {
+      ReactNoop.flushSync(() => {
+        ReactNoop.render(<AsyncText text="Async" />);
+      });
+    }).not.toThrow();
+  });
+
+  // @gate enableLegacyCache && !disableLegacyMode
+  it('in legacy mode, errors when an update suspends without a Suspense boundary during a sync update', async () => {
+    const root = ReactNoop.createLegacyRoot();
+    await expect(async () => {
+      await act(() => root.render(<AsyncText text="Async" />));
+    }).rejects.toThrow(
+      'A component suspended while responding to synchronous input.',
     );
   });
 
+  // @gate enableLegacyCache
   it('a Suspense component correctly handles more than one suspended child', async () => {
     ReactNoop.render(
       <Suspense fallback={<Text text="Loading..." />}>
-        <AsyncText text="A" ms={100} />
-        <AsyncText text="B" ms={100} />
+        <AsyncText text="A" />
+        <AsyncText text="B" />
       </Suspense>,
     );
-    Scheduler.unstable_advanceTime(10000);
-    expect(Scheduler).toFlushExpired([
-      'Suspend! [A]',
-      'Suspend! [B]',
-      'Loading...',
-    ]);
-    expect(ReactNoop.getChildren()).toEqual([span('Loading...')]);
+    await waitForAll(['Suspend! [A]', 'Loading...']);
+    expect(ReactNoop).toMatchRenderedOutput(<span prop="Loading..." />);
 
-    await advanceTimers(100);
-
-    expect(Scheduler).toHaveYielded([
-      'Promise resolved [A]',
-      'Promise resolved [B]',
-    ]);
-    expect(Scheduler).toFlushAndYield(['A', 'B']);
-    expect(ReactNoop.getChildren()).toEqual([span('A'), span('B')]);
+    await act(() => {
+      resolveText('A');
+      resolveText('B');
+    });
+    assertLog(['A', 'B']);
+    expect(ReactNoop).toMatchRenderedOutput(
+      <>
+        <span prop="A" />
+        <span prop="B" />
+      </>,
+    );
   });
 
+  // @gate enableLegacyCache
   it('can resume rendering earlier than a timeout', async () => {
     ReactNoop.render(<Suspense fallback={<Text text="Loading..." />} />);
-    expect(Scheduler).toFlushAndYield([]);
+    await waitForAll([]);
 
-    ReactNoop.render(
-      <Suspense fallback={<Text text="Loading..." />}>
-        <AsyncText text="Async" ms={100} />
-      </Suspense>,
-    );
-    expect(Scheduler).toFlushAndYield(['Suspend! [Async]', 'Loading...']);
-    expect(ReactNoop.getChildren()).toEqual([]);
-
-    // Advance time by an amount slightly smaller than what's necessary to
-    // resolve the promise
-    await advanceTimers(99);
-
-    // Nothing has rendered yet
-    expect(Scheduler).toFlushWithoutYielding();
-    expect(ReactNoop.getChildren()).toEqual([]);
+    React.startTransition(() => {
+      ReactNoop.render(
+        <Suspense fallback={<Text text="Loading..." />}>
+          <AsyncText text="Async" />
+        </Suspense>,
+      );
+    });
+    await waitForAll(['Suspend! [Async]', 'Loading...']);
+    expect(ReactNoop).toMatchRenderedOutput(null);
 
     // Resolve the promise
-    await advanceTimers(1);
+    await resolveText('Async');
     // We can now resume rendering
-    expect(Scheduler).toHaveYielded(['Promise resolved [Async]']);
-    expect(Scheduler).toFlushAndYield(['Async']);
-    expect(ReactNoop.getChildren()).toEqual([span('Async')]);
+    await waitForAll(['Async']);
+    expect(ReactNoop).toMatchRenderedOutput(<span prop="Async" />);
   });
 
-  // @gate experimental
+  // @gate enableLegacyCache
   it('starts working on an update even if its priority falls between two suspended levels', async () => {
     function App(props) {
       return (
@@ -947,7 +950,7 @@ describe('ReactSuspenseWithNoopRenderer', () => {
           {props.text === 'C' || props.text === 'S' ? (
             <Text text={props.text} />
           ) : (
-            <AsyncText text={props.text} ms={10000} />
+            <AsyncText text={props.text} />
           )}
         </Suspense>
       );
@@ -956,97 +959,48 @@ describe('ReactSuspenseWithNoopRenderer', () => {
     // First mount without suspending. This ensures we already have content
     // showing so that subsequent updates will suspend.
     ReactNoop.render(<App text="S" />);
-    expect(Scheduler).toFlushAndYield(['S']);
+    await waitForAll(['S']);
 
     // Schedule an update, and suspend for up to 5 seconds.
-    React.unstable_startTransition(() => ReactNoop.render(<App text="A" />));
+    React.startTransition(() => ReactNoop.render(<App text="A" />));
     // The update should suspend.
-    expect(Scheduler).toFlushAndYield(['Suspend! [A]', 'Loading...']);
-    expect(ReactNoop.getChildren()).toEqual([span('S')]);
+    await waitForAll(['Suspend! [A]', 'Loading...']);
+    expect(ReactNoop).toMatchRenderedOutput(<span prop="S" />);
 
     // Advance time until right before it expires.
     await advanceTimers(4999);
     ReactNoop.expire(4999);
-    expect(Scheduler).toFlushWithoutYielding();
-    expect(ReactNoop.getChildren()).toEqual([span('S')]);
+    await waitForAll([]);
+    expect(ReactNoop).toMatchRenderedOutput(<span prop="S" />);
 
     // Schedule another low priority update.
-    React.unstable_startTransition(() => ReactNoop.render(<App text="B" />));
+    React.startTransition(() => ReactNoop.render(<App text="B" />));
     // This update should also suspend.
-    expect(Scheduler).toFlushAndYield(['Suspend! [B]', 'Loading...']);
-    expect(ReactNoop.getChildren()).toEqual([span('S')]);
+    await waitForAll(['Suspend! [B]', 'Loading...']);
+    expect(ReactNoop).toMatchRenderedOutput(<span prop="S" />);
 
     // Schedule a regular update. Its expiration time will fall between
     // the expiration times of the previous two updates.
     ReactNoop.render(<App text="C" />);
-    expect(Scheduler).toFlushAndYield(['C']);
-    expect(ReactNoop.getChildren()).toEqual([span('C')]);
+    await waitForAll(['C']);
+    expect(ReactNoop).toMatchRenderedOutput(<span prop="C" />);
 
-    await advanceTimers(10000);
     // Flush the remaining work.
-    expect(Scheduler).toHaveYielded([
-      'Promise resolved [A]',
-      'Promise resolved [B]',
-    ]);
+    await resolveText('A');
+    await resolveText('B');
     // Nothing else to render.
-    expect(Scheduler).toFlushWithoutYielding();
-    expect(ReactNoop.getChildren()).toEqual([span('C')]);
+    await waitForAll([]);
+    expect(ReactNoop).toMatchRenderedOutput(<span prop="C" />);
   });
 
-  it('flushes all expired updates in a single batch', async () => {
-    class Foo extends React.Component {
-      componentDidUpdate() {
-        Scheduler.unstable_yieldValue('Commit: ' + this.props.text);
-      }
-      componentDidMount() {
-        Scheduler.unstable_yieldValue('Commit: ' + this.props.text);
-      }
-      render() {
-        return (
-          <Suspense fallback={<Text text="Loading..." />}>
-            <AsyncText ms={20000} text={this.props.text} />
-          </Suspense>
-        );
-      }
-    }
-
-    ReactNoop.render(<Foo text="" />);
-    ReactNoop.expire(1000);
-    jest.advanceTimersByTime(1000);
-    ReactNoop.render(<Foo text="go" />);
-    ReactNoop.expire(1000);
-    jest.advanceTimersByTime(1000);
-    ReactNoop.render(<Foo text="good" />);
-    ReactNoop.expire(1000);
-    jest.advanceTimersByTime(1000);
-    ReactNoop.render(<Foo text="goodbye" />);
-
-    Scheduler.unstable_advanceTime(10000);
-    jest.advanceTimersByTime(10000);
-
-    expect(Scheduler).toFlushExpired([
-      'Suspend! [goodbye]',
-      'Loading...',
-      'Commit: goodbye',
-    ]);
-    expect(ReactNoop.getChildren()).toEqual([span('Loading...')]);
-
-    Scheduler.unstable_advanceTime(20000);
-    await advanceTimers(20000);
-    expect(Scheduler).toHaveYielded(['Promise resolved [goodbye]']);
-    expect(ReactNoop.getChildren()).toEqual([span('Loading...')]);
-
-    expect(Scheduler).toFlushAndYield(['goodbye']);
-    expect(ReactNoop.getChildren()).toEqual([span('goodbye')]);
-  });
-
+  // @gate enableLegacyCache
   it('a suspended update that expires', async () => {
     // Regression test. This test used to fall into an infinite loop.
     function ExpensiveText({text}) {
       // This causes the update to expire.
       Scheduler.unstable_advanceTime(10000);
       // Then something suspends.
-      return <AsyncText text={text} ms={200000} />;
+      return <AsyncText text={text} />;
     }
 
     function App() {
@@ -1060,21 +1014,14 @@ describe('ReactSuspenseWithNoopRenderer', () => {
     }
 
     ReactNoop.render(<App />);
-    expect(Scheduler).toFlushAndYield([
-      'Suspend! [A]',
-      'Suspend! [B]',
-      'Suspend! [C]',
-    ]);
+    await waitForAll(['Suspend! [A]']);
     expect(ReactNoop).toMatchRenderedOutput('Loading...');
 
-    await advanceTimers(200000);
-    expect(Scheduler).toHaveYielded([
-      'Promise resolved [A]',
-      'Promise resolved [B]',
-      'Promise resolved [C]',
-    ]);
+    await resolveText('A');
+    await resolveText('B');
+    await resolveText('C');
 
-    expect(Scheduler).toFlushAndYield(['A', 'B', 'C']);
+    await waitForAll(['A', 'B', 'C']);
     expect(ReactNoop).toMatchRenderedOutput(
       <>
         <span prop="A" />
@@ -1085,33 +1032,35 @@ describe('ReactSuspenseWithNoopRenderer', () => {
   });
 
   describe('legacy mode mode', () => {
+    // @gate enableLegacyCache && !disableLegacyMode
     it('times out immediately', async () => {
       function App() {
         return (
           <Suspense fallback={<Text text="Loading..." />}>
-            <AsyncText ms={100} text="Result" />
+            <AsyncText text="Result" />
           </Suspense>
         );
       }
 
       // Times out immediately, ignoring the specified threshold.
       ReactNoop.renderLegacySyncRoot(<App />);
-      expect(Scheduler).toHaveYielded(['Suspend! [Result]', 'Loading...']);
-      expect(ReactNoop.getChildren()).toEqual([span('Loading...')]);
+      assertLog(['Suspend! [Result]', 'Loading...']);
+      expect(ReactNoop).toMatchRenderedOutput(<span prop="Loading..." />);
 
-      ReactNoop.expire(100);
-      await advanceTimers(100);
+      await act(() => {
+        resolveText('Result');
+      });
 
-      expect(Scheduler).toHaveYielded(['Promise resolved [Result]']);
-      expect(Scheduler).toFlushExpired(['Result']);
-      expect(ReactNoop.getChildren()).toEqual([span('Result')]);
+      assertLog(['Result']);
+      expect(ReactNoop).toMatchRenderedOutput(<span prop="Result" />);
     });
 
+    // @gate enableLegacyCache && !disableLegacyMode
     it('times out immediately when Suspense is in legacy mode', async () => {
       class UpdatingText extends React.Component {
         state = {step: 1};
         render() {
-          return <AsyncText ms={100} text={`Step: ${this.state.step}`} />;
+          return <AsyncText text={`Step: ${this.state.step}`} />;
         }
       }
 
@@ -1136,17 +1085,9 @@ describe('ReactSuspenseWithNoopRenderer', () => {
       }
 
       // Initial mount.
+      await seedNextTextCache('Step: 1');
       ReactNoop.renderLegacySyncRoot(<App />);
-      await advanceTimers(100);
-      expect(Scheduler).toHaveYielded([
-        'Suspend! [Step: 1]',
-        'Sibling',
-        'Loading (1)',
-        'Loading (2)',
-        'Loading (3)',
-        'Promise resolved [Step: 1]',
-      ]);
-      expect(Scheduler).toFlushExpired(['Step: 1']);
+      assertLog(['Step: 1', 'Sibling']);
       expect(ReactNoop).toMatchRenderedOutput(
         <>
           <span prop="Step: 1" />
@@ -1156,7 +1097,7 @@ describe('ReactSuspenseWithNoopRenderer', () => {
 
       // Update.
       text.current.setState({step: 2}, () =>
-        Scheduler.unstable_yieldValue('Update did commit'),
+        Scheduler.log('Update did commit'),
       );
 
       expect(ReactNoop.flushNextYield()).toEqual([
@@ -1176,9 +1117,10 @@ describe('ReactSuspenseWithNoopRenderer', () => {
         </>,
       );
 
-      await advanceTimers(100);
-      expect(Scheduler).toHaveYielded(['Promise resolved [Step: 2]']);
-      expect(Scheduler).toFlushExpired(['Step: 2']);
+      await act(() => {
+        resolveText('Step: 2');
+      });
+      assertLog(['Step: 2']);
       expect(ReactNoop).toMatchRenderedOutput(
         <>
           <span prop="Step: 2" />
@@ -1187,13 +1129,14 @@ describe('ReactSuspenseWithNoopRenderer', () => {
       );
     });
 
+    // @gate enableLegacyCache && !disableLegacyMode
     it('does not re-render siblings in loose mode', async () => {
       class TextWithLifecycle extends React.Component {
         componentDidMount() {
-          Scheduler.unstable_yieldValue(`Mount [${this.props.text}]`);
+          Scheduler.log(`Mount [${this.props.text}]`);
         }
         componentDidUpdate() {
-          Scheduler.unstable_yieldValue(`Update [${this.props.text}]`);
+          Scheduler.log(`Update [${this.props.text}]`);
         }
         render() {
           return <Text {...this.props} />;
@@ -1202,10 +1145,10 @@ describe('ReactSuspenseWithNoopRenderer', () => {
 
       class AsyncTextWithLifecycle extends React.Component {
         componentDidMount() {
-          Scheduler.unstable_yieldValue(`Mount [${this.props.text}]`);
+          Scheduler.log(`Mount [${this.props.text}]`);
         }
         componentDidUpdate() {
-          Scheduler.unstable_yieldValue(`Update [${this.props.text}]`);
+          Scheduler.log(`Update [${this.props.text}]`);
         }
         render() {
           return <AsyncText {...this.props} />;
@@ -1216,16 +1159,16 @@ describe('ReactSuspenseWithNoopRenderer', () => {
         return (
           <Suspense fallback={<TextWithLifecycle text="Loading..." />}>
             <TextWithLifecycle text="A" />
-            <AsyncTextWithLifecycle ms={100} text="B" />
+            <AsyncTextWithLifecycle text="B" />
             <TextWithLifecycle text="C" />
           </Suspense>
         );
       }
 
       ReactNoop.renderLegacySyncRoot(<App />, () =>
-        Scheduler.unstable_yieldValue('Commit root'),
+        Scheduler.log('Commit root'),
       );
-      expect(Scheduler).toHaveYielded([
+      assertLog([
         'A',
         'Suspend! [B]',
         'C',
@@ -1247,11 +1190,11 @@ describe('ReactSuspenseWithNoopRenderer', () => {
         </>,
       );
 
-      ReactNoop.expire(1000);
-      await advanceTimers(1000);
+      await act(() => {
+        resolveText('B');
+      });
 
-      expect(Scheduler).toHaveYielded(['Promise resolved [B]']);
-      expect(Scheduler).toFlushExpired(['B']);
+      assertLog(['B']);
       expect(ReactNoop).toMatchRenderedOutput(
         <>
           <span prop="A" />
@@ -1261,57 +1204,43 @@ describe('ReactSuspenseWithNoopRenderer', () => {
       );
     });
 
+    // @gate enableLegacyCache && !disableLegacyMode
     it('suspends inside constructor', async () => {
       class AsyncTextInConstructor extends React.Component {
         constructor(props) {
           super(props);
           const text = props.text;
-          Scheduler.unstable_yieldValue('constructor');
-          try {
-            readText(text);
-            this.state = {text};
-          } catch (promise) {
-            if (typeof promise.then === 'function') {
-              Scheduler.unstable_yieldValue(`Suspend! [${text}]`);
-            } else {
-              Scheduler.unstable_yieldValue(`Error! [${text}]`);
-            }
-            throw promise;
-          }
+          Scheduler.log('constructor');
+          readText(text);
+          this.state = {text};
         }
         componentDidMount() {
-          Scheduler.unstable_yieldValue('componentDidMount');
+          Scheduler.log('componentDidMount');
         }
         render() {
-          Scheduler.unstable_yieldValue(this.state.text);
+          Scheduler.log(this.state.text);
           return <span prop={this.state.text} />;
         }
       }
 
       ReactNoop.renderLegacySyncRoot(
         <Suspense fallback={<Text text="Loading..." />}>
-          <AsyncTextInConstructor ms={100} text="Hi" />
+          <AsyncTextInConstructor text="Hi" />
         </Suspense>,
       );
 
-      expect(Scheduler).toHaveYielded([
-        'constructor',
-        'Suspend! [Hi]',
-        'Loading...',
-      ]);
-      expect(ReactNoop.getChildren()).toEqual([span('Loading...')]);
+      assertLog(['constructor', 'Suspend! [Hi]', 'Loading...']);
+      expect(ReactNoop).toMatchRenderedOutput(<span prop="Loading..." />);
 
-      await resolveText('Hi');
+      await act(() => {
+        resolveText('Hi');
+      });
 
-      expect(Scheduler).toHaveYielded(['Promise resolved [Hi]']);
-      expect(Scheduler).toFlushExpired([
-        'constructor',
-        'Hi',
-        'componentDidMount',
-      ]);
-      expect(ReactNoop.getChildren()).toEqual([span('Hi')]);
+      assertLog(['constructor', 'Hi', 'componentDidMount']);
+      expect(ReactNoop).toMatchRenderedOutput(<span prop="Hi" />);
     });
 
+    // @gate enableLegacyCache && !disableLegacyMode
     it('does not infinite loop if fallback contains lifecycle method', async () => {
       class Fallback extends React.Component {
         state = {
@@ -1331,7 +1260,7 @@ describe('ReactSuspenseWithNoopRenderer', () => {
         render() {
           return (
             <Suspense fallback={<Fallback />}>
-              <AsyncText text="Hi" ms={100} />
+              <AsyncText text="Hi" />
             </Suspense>
           );
         }
@@ -1339,20 +1268,22 @@ describe('ReactSuspenseWithNoopRenderer', () => {
 
       ReactNoop.renderLegacySyncRoot(<Demo />);
 
-      expect(Scheduler).toHaveYielded([
+      assertLog([
         'Suspend! [Hi]',
         'Loading...',
         // Re-render due to lifecycle update
         'Loading...',
       ]);
-      expect(ReactNoop.getChildren()).toEqual([span('Loading...')]);
-      await advanceTimers(100);
-      expect(Scheduler).toHaveYielded(['Promise resolved [Hi]']);
-      expect(Scheduler).toFlushExpired(['Hi']);
-      expect(ReactNoop.getChildren()).toEqual([span('Hi')]);
+      expect(ReactNoop).toMatchRenderedOutput(<span prop="Loading..." />);
+      await act(() => {
+        resolveText('Hi');
+      });
+      assertLog(['Hi']);
+      expect(ReactNoop).toMatchRenderedOutput(<span prop="Hi" />);
     });
 
     if (global.__PERSISTENT__) {
+      // @gate enableLegacyCache && !disableLegacyMode
       it('hides/unhides suspended children before layout effects fire (persistent)', async () => {
         const {useRef, useLayoutEffect} = React;
 
@@ -1360,12 +1291,12 @@ describe('ReactSuspenseWithNoopRenderer', () => {
           const child = useRef(null);
 
           useLayoutEffect(() => {
-            Scheduler.unstable_yieldValue(ReactNoop.getPendingChildrenAsJSX());
+            Scheduler.log(ReactNoop.getPendingChildrenAsJSX());
           });
 
           return (
             <span ref={child} hidden={false}>
-              <AsyncText ms={1000} text="Hi" />
+              <AsyncText text="Hi" />
             </span>
           );
         }
@@ -1380,7 +1311,7 @@ describe('ReactSuspenseWithNoopRenderer', () => {
 
         ReactNoop.renderLegacySyncRoot(<App middleText="B" />);
 
-        expect(Scheduler).toHaveYielded([
+        assertLog([
           'Suspend! [Hi]',
           'Loading...',
           // The child should have already been hidden
@@ -1390,12 +1321,13 @@ describe('ReactSuspenseWithNoopRenderer', () => {
           </>,
         ]);
 
-        await advanceTimers(1000);
-
-        expect(Scheduler).toHaveYielded(['Promise resolved [Hi]']);
-        expect(Scheduler).toFlushExpired(['Hi']);
+        await act(() => {
+          resolveText('Hi');
+        });
+        assertLog(['Hi']);
       });
     } else {
+      // @gate enableLegacyCache && !disableLegacyMode
       it('hides/unhides suspended children before layout effects fire (mutation)', async () => {
         const {useRef, useLayoutEffect} = React;
 
@@ -1403,14 +1335,12 @@ describe('ReactSuspenseWithNoopRenderer', () => {
           const child = useRef(null);
 
           useLayoutEffect(() => {
-            Scheduler.unstable_yieldValue(
-              'Child is hidden: ' + child.current.hidden,
-            );
+            Scheduler.log('Child is hidden: ' + child.current.hidden);
           });
 
           return (
             <span ref={child} hidden={false}>
-              <AsyncText ms={1000} text="Hi" />
+              <AsyncText text="Hi" />
             </span>
           );
         }
@@ -1425,20 +1355,22 @@ describe('ReactSuspenseWithNoopRenderer', () => {
 
         ReactNoop.renderLegacySyncRoot(<App middleText="B" />);
 
-        expect(Scheduler).toHaveYielded([
+        assertLog([
           'Suspend! [Hi]',
           'Loading...',
           // The child should have already been hidden
           'Child is hidden: true',
         ]);
 
-        await advanceTimers(1000);
+        await act(() => {
+          resolveText('Hi');
+        });
 
-        expect(Scheduler).toHaveYielded(['Promise resolved [Hi]']);
-        expect(Scheduler).toFlushExpired(['Hi']);
+        assertLog(['Hi']);
       });
     }
 
+    // @gate enableLegacyCache && !disableLegacyMode
     it('handles errors in the return path of a component that suspends', async () => {
       // Covers an edge case where an error is thrown inside the complete phase
       // of a component that is in the return path of a component that suspends.
@@ -1461,18 +1393,19 @@ describe('ReactSuspenseWithNoopRenderer', () => {
         <ErrorBoundary>
           <Suspense fallback="Loading...">
             <errorInCompletePhase>
-              <AsyncText ms={1000} text="Async" />
+              <AsyncText text="Async" />
             </errorInCompletePhase>
           </Suspense>
         </ErrorBoundary>,
       );
 
-      expect(Scheduler).toHaveYielded(['Suspend! [Async]']);
+      assertLog(['Suspend! [Async]']);
       expect(ReactNoop).toMatchRenderedOutput(
         'Caught an error: Error in host config.',
       );
     });
 
+    // @gate !disableLegacyMode
     it('does not drop mounted effects', async () => {
       const never = {then() {}};
 
@@ -1493,9 +1426,9 @@ describe('ReactSuspenseWithNoopRenderer', () => {
         }
 
         React.useEffect(() => {
-          Scheduler.unstable_yieldValue('Mount');
+          Scheduler.log('Mount');
           return () => {
-            Scheduler.unstable_yieldValue('Unmount');
+            Scheduler.log('Unmount');
           };
         }, []);
 
@@ -1503,36 +1436,37 @@ describe('ReactSuspenseWithNoopRenderer', () => {
       }
 
       const root = ReactNoop.createLegacyRoot(null);
-      await ReactNoop.act(async () => {
+      await act(() => {
         root.render(<App />);
       });
-      expect(Scheduler).toHaveYielded(['Mount']);
+      assertLog(['Mount']);
       expect(root).toMatchRenderedOutput('Child');
 
       // Suspend the child. This puts it into an inconsistent state.
-      await ReactNoop.act(async () => {
+      await act(() => {
         setShouldSuspend(true);
       });
       expect(root).toMatchRenderedOutput('Loading...');
 
-      // Unmount everying
-      await ReactNoop.act(async () => {
+      // Unmount everything
+      await act(() => {
         root.render(null);
       });
-      expect(Scheduler).toHaveYielded(['Unmount']);
+      assertLog(['Unmount']);
     });
   });
 
+  // @gate enableLegacyCache && !disableLegacyMode
   it('does not call lifecycles of a suspended component', async () => {
     class TextWithLifecycle extends React.Component {
       componentDidMount() {
-        Scheduler.unstable_yieldValue(`Mount [${this.props.text}]`);
+        Scheduler.log(`Mount [${this.props.text}]`);
       }
       componentDidUpdate() {
-        Scheduler.unstable_yieldValue(`Update [${this.props.text}]`);
+        Scheduler.log(`Update [${this.props.text}]`);
       }
       componentWillUnmount() {
-        Scheduler.unstable_yieldValue(`Unmount [${this.props.text}]`);
+        Scheduler.log(`Unmount [${this.props.text}]`);
       }
       render() {
         return <Text {...this.props} />;
@@ -1541,28 +1475,19 @@ describe('ReactSuspenseWithNoopRenderer', () => {
 
     class AsyncTextWithLifecycle extends React.Component {
       componentDidMount() {
-        Scheduler.unstable_yieldValue(`Mount [${this.props.text}]`);
+        Scheduler.log(`Mount [${this.props.text}]`);
       }
       componentDidUpdate() {
-        Scheduler.unstable_yieldValue(`Update [${this.props.text}]`);
+        Scheduler.log(`Update [${this.props.text}]`);
       }
       componentWillUnmount() {
-        Scheduler.unstable_yieldValue(`Unmount [${this.props.text}]`);
+        Scheduler.log(`Unmount [${this.props.text}]`);
       }
       render() {
         const text = this.props.text;
-        try {
-          readText(text);
-          Scheduler.unstable_yieldValue(text);
-          return <span prop={text} />;
-        } catch (promise) {
-          if (typeof promise.then === 'function') {
-            Scheduler.unstable_yieldValue(`Suspend! [${text}]`);
-          } else {
-            Scheduler.unstable_yieldValue(`Error! [${text}]`);
-          }
-          throw promise;
-        }
+        readText(text);
+        Scheduler.log(text);
+        return <span prop={text} />;
       }
     }
 
@@ -1570,16 +1495,14 @@ describe('ReactSuspenseWithNoopRenderer', () => {
       return (
         <Suspense fallback={<TextWithLifecycle text="Loading..." />}>
           <TextWithLifecycle text="A" />
-          <AsyncTextWithLifecycle ms={100} text="B" />
+          <AsyncTextWithLifecycle text="B" />
           <TextWithLifecycle text="C" />
         </Suspense>
       );
     }
 
-    ReactNoop.renderLegacySyncRoot(<App />, () =>
-      Scheduler.unstable_yieldValue('Commit root'),
-    );
-    expect(Scheduler).toHaveYielded([
+    ReactNoop.renderLegacySyncRoot(<App />, () => Scheduler.log('Commit root'));
+    assertLog([
       'A',
       'Suspend! [B]',
       'C',
@@ -1601,20 +1524,19 @@ describe('ReactSuspenseWithNoopRenderer', () => {
     );
   });
 
+  // @gate enableLegacyCache && !disableLegacyMode
   it('does not call lifecycles of a suspended component (hooks)', async () => {
     function TextWithLifecycle(props) {
       React.useLayoutEffect(() => {
-        Scheduler.unstable_yieldValue(`Layout Effect [${props.text}]`);
+        Scheduler.log(`Layout Effect [${props.text}]`);
         return () => {
-          Scheduler.unstable_yieldValue(
-            `Destroy Layout Effect [${props.text}]`,
-          );
+          Scheduler.log(`Destroy Layout Effect [${props.text}]`);
         };
       }, [props.text]);
       React.useEffect(() => {
-        Scheduler.unstable_yieldValue(`Effect [${props.text}]`);
+        Scheduler.log(`Effect [${props.text}]`);
         return () => {
-          Scheduler.unstable_yieldValue(`Destroy Effect [${props.text}]`);
+          Scheduler.log(`Destroy Effect [${props.text}]`);
         };
       }, [props.text]);
       return <Text {...props} />;
@@ -1622,48 +1544,37 @@ describe('ReactSuspenseWithNoopRenderer', () => {
 
     function AsyncTextWithLifecycle(props) {
       React.useLayoutEffect(() => {
-        Scheduler.unstable_yieldValue(`Layout Effect [${props.text}]`);
+        Scheduler.log(`Layout Effect [${props.text}]`);
         return () => {
-          Scheduler.unstable_yieldValue(
-            `Destroy Layout Effect [${props.text}]`,
-          );
+          Scheduler.log(`Destroy Layout Effect [${props.text}]`);
         };
       }, [props.text]);
       React.useEffect(() => {
-        Scheduler.unstable_yieldValue(`Effect [${props.text}]`);
+        Scheduler.log(`Effect [${props.text}]`);
         return () => {
-          Scheduler.unstable_yieldValue(`Destroy Effect [${props.text}]`);
+          Scheduler.log(`Destroy Effect [${props.text}]`);
         };
       }, [props.text]);
       const text = props.text;
-      try {
-        readText(text);
-        Scheduler.unstable_yieldValue(text);
-        return <span prop={text} />;
-      } catch (promise) {
-        if (typeof promise.then === 'function') {
-          Scheduler.unstable_yieldValue(`Suspend! [${text}]`);
-        } else {
-          Scheduler.unstable_yieldValue(`Error! [${text}]`);
-        }
-        throw promise;
-      }
+      readText(text);
+      Scheduler.log(text);
+      return <span prop={text} />;
     }
 
     function App({text}) {
       return (
         <Suspense fallback={<TextWithLifecycle text="Loading..." />}>
           <TextWithLifecycle text="A" />
-          <AsyncTextWithLifecycle ms={100} text={text} />
+          <AsyncTextWithLifecycle text={text} />
           <TextWithLifecycle text="C" />
         </Suspense>
       );
     }
 
     ReactNoop.renderLegacySyncRoot(<App text="B" />, () =>
-      Scheduler.unstable_yieldValue('Commit root'),
+      Scheduler.log('Commit root'),
     );
-    expect(Scheduler).toHaveYielded([
+    assertLog([
       'A',
       'Suspend! [B]',
       'C',
@@ -1678,7 +1589,7 @@ describe('ReactSuspenseWithNoopRenderer', () => {
     ]);
 
     // Flush passive effects.
-    expect(Scheduler).toFlushAndYield([
+    await waitForAll([
       'Effect [A]',
       // B's effect should not fire because it suspended
       // 'Effect [B]',
@@ -1694,11 +1605,11 @@ describe('ReactSuspenseWithNoopRenderer', () => {
       </>,
     );
 
-    await resolveText('B');
+    await act(() => {
+      resolveText('B');
+    });
 
-    expect(Scheduler).toHaveYielded(['Promise resolved [B]']);
-
-    expect(Scheduler).toFlushAndYield([
+    assertLog([
       'B',
       'Destroy Layout Effect [Loading...]',
       'Layout Effect [B]',
@@ -1708,10 +1619,10 @@ describe('ReactSuspenseWithNoopRenderer', () => {
 
     // Update
     ReactNoop.renderLegacySyncRoot(<App text="B2" />, () =>
-      Scheduler.unstable_yieldValue('Commit root'),
+      Scheduler.log('Commit root'),
     );
 
-    expect(Scheduler).toHaveYielded([
+    assertLog([
       'A',
       'Suspend! [B2]',
       'C',
@@ -1724,16 +1635,17 @@ describe('ReactSuspenseWithNoopRenderer', () => {
     ]);
 
     // Flush passive effects.
-    expect(Scheduler).toFlushAndYield([
+    await waitForAll([
       // B2's effect should not fire because it suspended
       // 'Effect [B2]',
       'Effect [Loading...]',
     ]);
 
-    await resolveText('B2');
+    await act(() => {
+      resolveText('B2');
+    });
 
-    expect(Scheduler).toHaveYielded(['Promise resolved [B2]']);
-    expect(Scheduler).toFlushAndYield([
+    assertLog([
       'B2',
       'Destroy Layout Effect [Loading...]',
       'Destroy Layout Effect [B]',
@@ -1744,67 +1656,15 @@ describe('ReactSuspenseWithNoopRenderer', () => {
     ]);
   });
 
-  it('suspends for longer if something took a long (CPU bound) time to render', async () => {
-    function Foo({renderContent}) {
-      Scheduler.unstable_yieldValue('Foo');
-      return (
-        <Suspense fallback={<Text text="Loading..." />}>
-          {renderContent ? <AsyncText text="A" ms={5000} /> : null}
-        </Suspense>
-      );
-    }
-
-    ReactNoop.render(<Foo />);
-    expect(Scheduler).toFlushAndYield(['Foo']);
-
-    ReactNoop.render(<Foo renderContent={true} />);
-    Scheduler.unstable_advanceTime(100);
-    await advanceTimers(100);
-    // Start rendering
-    expect(Scheduler).toFlushAndYieldThrough(['Foo']);
-    // For some reason it took a long time to render Foo.
-    Scheduler.unstable_advanceTime(1250);
-    await advanceTimers(1250);
-    expect(Scheduler).toFlushAndYield([
-      // A suspends
-      'Suspend! [A]',
-      'Loading...',
-    ]);
-    // We're now suspended and we haven't shown anything yet.
-    expect(ReactNoop.getChildren()).toEqual([]);
-
-    // Flush some of the time
-    Scheduler.unstable_advanceTime(450);
-    await advanceTimers(450);
-    // Because we've already been waiting for so long we can
-    // wait a bit longer. Still nothing...
-    expect(Scheduler).toFlushWithoutYielding();
-    expect(ReactNoop.getChildren()).toEqual([]);
-
-    // Eventually we'll show the fallback.
-    Scheduler.unstable_advanceTime(500);
-    await advanceTimers(500);
-    // No need to rerender.
-    expect(Scheduler).toFlushWithoutYielding();
-    expect(ReactNoop.getChildren()).toEqual([span('Loading...')]);
-
-    // Flush the promise completely
-    Scheduler.unstable_advanceTime(4500);
-    await advanceTimers(4500);
-    // Renders successfully
-    expect(Scheduler).toHaveYielded(['Promise resolved [A]']);
-    expect(Scheduler).toFlushAndYield(['A']);
-    expect(ReactNoop.getChildren()).toEqual([span('A')]);
-  });
-
+  // @gate enableLegacyCache
   it('does not suspends if a fallback has been shown for a long time', async () => {
     function Foo() {
-      Scheduler.unstable_yieldValue('Foo');
+      Scheduler.log('Foo');
       return (
         <Suspense fallback={<Text text="Loading..." />}>
-          <AsyncText text="A" ms={5000} />
+          <AsyncText text="A" />
           <Suspense fallback={<Text text="Loading more..." />}>
-            <AsyncText text="B" ms={10000} />
+            <AsyncText text="B" />
           </Suspense>
         </Suspense>
       );
@@ -1812,53 +1672,57 @@ describe('ReactSuspenseWithNoopRenderer', () => {
 
     ReactNoop.render(<Foo />);
     // Start rendering
-    expect(Scheduler).toFlushAndYield([
+    await waitForAll([
       'Foo',
       // A suspends
       'Suspend! [A]',
-      // B suspends
-      'Suspend! [B]',
-      'Loading more...',
       'Loading...',
     ]);
-    expect(ReactNoop.getChildren()).toEqual([span('Loading...')]);
+    expect(ReactNoop).toMatchRenderedOutput(<span prop="Loading..." />);
 
     // Wait a long time.
     Scheduler.unstable_advanceTime(5000);
     await advanceTimers(5000);
-    expect(Scheduler).toHaveYielded(['Promise resolved [A]']);
 
     // Retry with the new content.
-    expect(Scheduler).toFlushAndYield([
+    await resolveText('A');
+    await waitForAll([
       'A',
-      // B still suspends
+      // B suspends
       'Suspend! [B]',
       'Loading more...',
     ]);
+
     // Because we've already been waiting for so long we've exceeded
     // our threshold and we show the next level immediately.
-    expect(ReactNoop.getChildren()).toEqual([
-      span('A'),
-      span('Loading more...'),
-    ]);
+    expect(ReactNoop).toMatchRenderedOutput(
+      <>
+        <span prop="A" />
+        <span prop="Loading more..." />
+      </>,
+    );
 
     // Flush the last promise completely
-    Scheduler.unstable_advanceTime(5000);
-    await advanceTimers(5000);
+    await act(() => resolveText('B'));
     // Renders successfully
-    expect(Scheduler).toHaveYielded(['Promise resolved [B]']);
-    expect(Scheduler).toFlushAndYield(['B']);
-    expect(ReactNoop.getChildren()).toEqual([span('A'), span('B')]);
+    assertLog(['B']);
+    expect(ReactNoop).toMatchRenderedOutput(
+      <>
+        <span prop="A" />
+        <span prop="B" />
+      </>,
+    );
   });
 
-  it('does suspend if a fallback has been shown for a short time', async () => {
+  // @gate enableLegacyCache
+  it('throttles content from appearing if a fallback was shown recently', async () => {
     function Foo() {
-      Scheduler.unstable_yieldValue('Foo');
+      Scheduler.log('Foo');
       return (
         <Suspense fallback={<Text text="Loading..." />}>
-          <AsyncText text="A" ms={200} />
+          <AsyncText text="A" />
           <Suspense fallback={<Text text="Loading more..." />}>
-            <AsyncText text="B" ms={450} />
+            <AsyncText text="B" />
           </Suspense>
         </Suspense>
       );
@@ -1866,89 +1730,163 @@ describe('ReactSuspenseWithNoopRenderer', () => {
 
     ReactNoop.render(<Foo />);
     // Start rendering
-    expect(Scheduler).toFlushAndYield([
+    await waitForAll([
       'Foo',
       // A suspends
       'Suspend! [A]',
-      // B suspends
-      'Suspend! [B]',
-      'Loading more...',
       'Loading...',
     ]);
-    expect(ReactNoop.getChildren()).toEqual([span('Loading...')]);
+    expect(ReactNoop).toMatchRenderedOutput(<span prop="Loading..." />);
 
-    // Wait a short time.
-    Scheduler.unstable_advanceTime(250);
-    await advanceTimers(250);
-    expect(Scheduler).toHaveYielded(['Promise resolved [A]']);
+    await act(async () => {
+      await resolveText('A');
 
-    // Retry with the new content.
-    expect(Scheduler).toFlushAndYield([
-      'A',
-      // B still suspends
-      'Suspend! [B]',
-      'Loading more...',
-    ]);
-    // Because we've already been waiting for so long we can
-    // wait a bit longer. Still nothing...
-    expect(ReactNoop.getChildren()).toEqual([span('Loading...')]);
+      // Retry with the new content.
+      await waitForAll([
+        'A',
+        // B suspends
+        'Suspend! [B]',
+        'Loading more...',
+      ]);
+      // Because we've already been waiting for so long we can
+      // wait a bit longer. Still nothing...
+      expect(ReactNoop).toMatchRenderedOutput(<span prop="Loading..." />);
 
-    Scheduler.unstable_advanceTime(200);
-    await advanceTimers(200);
+      // Before we commit another Promise resolves.
+      // We're still showing the first loading state.
+      await resolveText('B');
+      expect(ReactNoop).toMatchRenderedOutput(<span prop="Loading..." />);
 
-    // Before we commit another Promise resolves.
-    expect(Scheduler).toHaveYielded(['Promise resolved [B]']);
-    // We're still showing the first loading state.
-    expect(ReactNoop.getChildren()).toEqual([span('Loading...')]);
-    // Restart and render the complete content.
-    expect(Scheduler).toFlushAndYield(['A', 'B']);
-    expect(ReactNoop.getChildren()).toEqual([span('A'), span('B')]);
+      // Restart and render the complete content.
+      await waitForAll(['A', 'B']);
+
+      if (gate(flags => flags.alwaysThrottleRetries)) {
+        // Correct behavior:
+        //
+        // The tree will finish but we won't commit the result yet because the fallback appeared recently.
+        expect(ReactNoop).toMatchRenderedOutput(<span prop="Loading..." />);
+      } else {
+        // Old behavior, gated until this rolls out at Meta:
+        //
+        // TODO: Because this render was the result of a retry, and a fallback
+        // was shown recently, we should suspend and remain on the fallback for
+        // little bit longer. We currently only do this if there's still
+        // remaining fallbacks in the tree, but we should do it for all retries.
+        expect(ReactNoop).toMatchRenderedOutput(
+          <>
+            <span prop="A" />
+            <span prop="B" />
+          </>,
+        );
+      }
+    });
+    assertLog([]);
+    expect(ReactNoop).toMatchRenderedOutput(
+      <>
+        <span prop="A" />
+        <span prop="B" />
+      </>,
+    );
   });
 
-  it('does not suspend for very long after a higher priority update', async () => {
-    function Foo({renderContent}) {
-      Scheduler.unstable_yieldValue('Foo');
+  // @gate enableLegacyCache
+  it('throttles content from appearing if a fallback was filled in recently', async () => {
+    function Foo() {
+      Scheduler.log('Foo');
       return (
-        <Suspense fallback={<Text text="Loading..." />}>
-          {renderContent ? <AsyncText text="A" ms={5000} /> : null}
-        </Suspense>
+        <>
+          <Suspense fallback={<Text text="Loading A..." />}>
+            <AsyncText text="A" />
+          </Suspense>
+          <Suspense fallback={<Text text="Loading B..." />}>
+            <AsyncText text="B" />
+          </Suspense>
+        </>
       );
     }
 
     ReactNoop.render(<Foo />);
-    expect(Scheduler).toFlushAndYield(['Foo']);
-
-    ReactNoop.discreteUpdates(() =>
-      ReactNoop.render(<Foo renderContent={true} />),
-    );
-    expect(Scheduler).toFlushAndYieldThrough(['Foo']);
-
-    // Advance some time.
-    Scheduler.unstable_advanceTime(100);
-    await advanceTimers(100);
-
-    expect(Scheduler).toFlushAndYield([
-      // A suspends
+    // Start rendering
+    await waitForAll([
+      'Foo',
       'Suspend! [A]',
-      'Loading...',
+      'Loading A...',
+      'Suspend! [B]',
+      'Loading B...',
     ]);
+    expect(ReactNoop).toMatchRenderedOutput(
+      <>
+        <span prop="Loading A..." />
+        <span prop="Loading B..." />
+      </>,
+    );
 
-    // We're now suspended and we haven't shown anything yet.
-    expect(ReactNoop.getChildren()).toEqual([]);
+    // Resolve only A. B will still be loading.
+    await act(async () => {
+      await resolveText('A');
 
-    // Flush some of the time
-    Scheduler.unstable_advanceTime(500);
-    jest.advanceTimersByTime(500);
+      // If we didn't advance the time here, A would not commit; it would
+      // be throttled because the fallback would have appeared too recently.
+      Scheduler.unstable_advanceTime(10000);
+      jest.advanceTimersByTime(10000);
+      await waitForPaint(['A']);
+      expect(ReactNoop).toMatchRenderedOutput(
+        <>
+          <span prop="A" />
+          <span prop="Loading B..." />
+        </>,
+      );
+    });
 
-    // We should have already shown the fallback.
-    // When we wrote this test, we inferred the start time of high priority
-    // updates as way earlier in the past. This test ensures that we don't
-    // use this assumption to add a very long JND.
-    expect(Scheduler).toFlushWithoutYielding();
-    expect(ReactNoop.getChildren()).toEqual([span('Loading...')]);
+    // Advance by a small amount of time. For testing purposes, this is meant
+    // to be just under the throttling interval. It's a heurstic, though, so
+    // if we adjust the heuristic we might have to update this test, too.
+    Scheduler.unstable_advanceTime(200);
+    jest.advanceTimersByTime(200);
+
+    // Now resolve B.
+    await act(async () => {
+      await resolveText('B');
+      await waitForPaint(['B']);
+
+      if (gate(flags => flags.alwaysThrottleRetries)) {
+        // B should not commit yet. Even though it's been a long time since its
+        // fallback was shown, it hasn't been long since A appeared. So B's
+        // appearance is throttled to reduce jank.
+        expect(ReactNoop).toMatchRenderedOutput(
+          <>
+            <span prop="A" />
+            <span prop="Loading B..." />
+          </>,
+        );
+
+        // Advance time a little bit more. Now it commits because enough time
+        // has passed.
+        Scheduler.unstable_advanceTime(100);
+        jest.advanceTimersByTime(100);
+        await waitForAll([]);
+        expect(ReactNoop).toMatchRenderedOutput(
+          <>
+            <span prop="A" />
+            <span prop="B" />
+          </>,
+        );
+      } else {
+        // Old behavior, gated until this rolls out at Meta:
+        //
+        // B appears immediately, without being throttled.
+        expect(ReactNoop).toMatchRenderedOutput(
+          <>
+            <span prop="A" />
+            <span prop="B" />
+          </>,
+        );
+      }
+    });
   });
 
   // TODO: flip to "warns" when this is implemented again.
+  // @gate enableLegacyCache
   it('does not warn when a low priority update suspends inside a high priority update for functional components', async () => {
     let _setShow;
     function App() {
@@ -1961,20 +1899,18 @@ describe('ReactSuspenseWithNoopRenderer', () => {
       );
     }
 
-    await ReactNoop.act(async () => {
+    await act(() => {
       ReactNoop.render(<App />);
     });
 
     // TODO: assert toErrorDev() when the warning is implemented again.
-    ReactNoop.act(() => {
-      Scheduler.unstable_runWithPriority(
-        Scheduler.unstable_UserBlockingPriority,
-        () => _setShow(true),
-      );
+    await act(() => {
+      ReactNoop.flushSync(() => _setShow(true));
     });
   });
 
   // TODO: flip to "warns" when this is implemented again.
+  // @gate enableLegacyCache
   it('does not warn when a low priority update suspends inside a high priority update for class components', async () => {
     let show;
     class App extends React.Component {
@@ -1990,19 +1926,17 @@ describe('ReactSuspenseWithNoopRenderer', () => {
       }
     }
 
-    await ReactNoop.act(async () => {
+    await act(() => {
       ReactNoop.render(<App />);
     });
 
     // TODO: assert toErrorDev() when the warning is implemented again.
-    ReactNoop.act(() => {
-      Scheduler.unstable_runWithPriority(
-        Scheduler.unstable_UserBlockingPriority,
-        () => show(),
-      );
+    await act(() => {
+      ReactNoop.flushSync(() => show());
     });
   });
 
+  // @gate enableLegacyCache
   it('does not warn about wrong Suspense priority if no new fallbacks are shown', async () => {
     let showB;
     class App extends React.Component {
@@ -2019,24 +1953,22 @@ describe('ReactSuspenseWithNoopRenderer', () => {
       }
     }
 
-    await ReactNoop.act(async () => {
+    await act(() => {
       ReactNoop.render(<App />);
     });
 
-    expect(Scheduler).toHaveYielded(['Suspend! [A]']);
+    assertLog(['Suspend! [A]']);
     expect(ReactNoop).toMatchRenderedOutput('Loading...');
 
-    ReactNoop.act(() => {
-      Scheduler.unstable_runWithPriority(
-        Scheduler.unstable_UserBlockingPriority,
-        () => showB(),
-      );
+    await act(() => {
+      ReactNoop.flushSync(() => showB());
     });
 
-    expect(Scheduler).toHaveYielded(['Suspend! [A]', 'Suspend! [B]']);
+    assertLog(['Suspend! [A]']);
   });
 
   // TODO: flip to "warns" when this is implemented again.
+  // @gate enableLegacyCache
   it(
     'does not warn when component that triggered user-blocking update is between Suspense boundary ' +
       'and component that suspended',
@@ -2054,20 +1986,18 @@ describe('ReactSuspenseWithNoopRenderer', () => {
           </Suspense>
         );
       }
-      await ReactNoop.act(async () => {
+      await act(() => {
         ReactNoop.render(<App />);
       });
 
       // TODO: assert toErrorDev() when the warning is implemented again.
-      ReactNoop.act(() => {
-        Scheduler.unstable_runWithPriority(
-          Scheduler.unstable_UserBlockingPriority,
-          () => _setShow(true),
-        );
+      await act(() => {
+        ReactNoop.flushSync(() => _setShow(true));
       });
     },
   );
 
+  // @gate enableLegacyCache
   it('normal priority updates suspending do not warn for class components', async () => {
     let show;
     class App extends React.Component {
@@ -2083,19 +2013,20 @@ describe('ReactSuspenseWithNoopRenderer', () => {
       }
     }
 
-    await ReactNoop.act(async () => {
+    await act(() => {
       ReactNoop.render(<App />);
     });
 
     // also make sure lowpriority is okay
-    await ReactNoop.act(async () => show(true));
+    await act(() => show(true));
 
-    expect(Scheduler).toHaveYielded(['Suspend! [A]']);
+    assertLog(['Suspend! [A]']);
     await resolveText('A');
 
-    expect(Scheduler).toHaveYielded(['Promise resolved [A]']);
+    expect(ReactNoop).toMatchRenderedOutput('Loading...');
   });
 
+  // @gate enableLegacyCache
   it('normal priority updates suspending do not warn for functional components', async () => {
     let _setShow;
     function App() {
@@ -2108,29 +2039,30 @@ describe('ReactSuspenseWithNoopRenderer', () => {
       );
     }
 
-    await ReactNoop.act(async () => {
+    await act(() => {
       ReactNoop.render(<App />);
     });
 
     // also make sure lowpriority is okay
-    await ReactNoop.act(async () => _setShow(true));
+    await act(() => _setShow(true));
 
-    expect(Scheduler).toHaveYielded(['Suspend! [A]']);
+    assertLog(['Suspend! [A]']);
     await resolveText('A');
 
-    expect(Scheduler).toHaveYielded(['Promise resolved [A]']);
+    expect(ReactNoop).toMatchRenderedOutput('Loading...');
   });
 
+  // @gate enableLegacyCache && enableSuspenseAvoidThisFallback
   it('shows the parent fallback if the inner fallback should be avoided', async () => {
     function Foo({showC}) {
-      Scheduler.unstable_yieldValue('Foo');
+      Scheduler.log('Foo');
       return (
         <Suspense fallback={<Text text="Initial load..." />}>
           <Suspense
             unstable_avoidThisFallback={true}
             fallback={<Text text="Updating..." />}>
-            <AsyncText text="A" ms={5000} />
-            {showC ? <AsyncText text="C" ms={5000} /> : null}
+            <AsyncText text="A" />
+            {showC ? <AsyncText text="C" /> : null}
           </Suspense>
           <Text text="B" />
         </Suspense>
@@ -2138,52 +2070,116 @@ describe('ReactSuspenseWithNoopRenderer', () => {
     }
 
     ReactNoop.render(<Foo />);
-    expect(Scheduler).toFlushAndYield([
-      'Foo',
-      'Suspend! [A]',
-      'B',
-      'Initial load...',
-    ]);
-    expect(ReactNoop.getChildren()).toEqual([span('Initial load...')]);
+    await waitForAll(['Foo', 'Suspend! [A]', 'Initial load...']);
+    expect(ReactNoop).toMatchRenderedOutput(<span prop="Initial load..." />);
 
     // Eventually we resolve and show the data.
-    Scheduler.unstable_advanceTime(5000);
-    await advanceTimers(5000);
-    expect(Scheduler).toHaveYielded(['Promise resolved [A]']);
-    expect(Scheduler).toFlushAndYield(['A', 'B']);
-    expect(ReactNoop.getChildren()).toEqual([span('A'), span('B')]);
+    await act(() => resolveText('A'));
+    assertLog(['A', 'B']);
+    expect(ReactNoop).toMatchRenderedOutput(
+      <>
+        <span prop="A" />
+        <span prop="B" />
+      </>,
+    );
 
     // Update to show C
     ReactNoop.render(<Foo showC={true} />);
-    expect(Scheduler).toFlushAndYield([
-      'Foo',
-      'A',
-      'Suspend! [C]',
-      'Updating...',
-      'B',
-    ]);
+    await waitForAll(['Foo', 'A', 'Suspend! [C]', 'Updating...', 'B']);
     // Flush to skip suspended time.
     Scheduler.unstable_advanceTime(600);
     await advanceTimers(600);
     // Since the optional suspense boundary is already showing its content,
     // we have to use the inner fallback instead.
-    expect(ReactNoop.getChildren()).toEqual([
-      hiddenSpan('A'),
-      span('Updating...'),
-      span('B'),
-    ]);
+    expect(ReactNoop).toMatchRenderedOutput(
+      <>
+        <span prop="A" hidden={true} />
+        <span prop="Updating..." />
+        <span prop="B" />
+      </>,
+    );
 
     // Later we load the data.
-    Scheduler.unstable_advanceTime(5000);
-    await advanceTimers(5000);
-    expect(Scheduler).toHaveYielded(['Promise resolved [C]']);
-    expect(Scheduler).toFlushAndYield(['A', 'C']);
-    expect(ReactNoop.getChildren()).toEqual([span('A'), span('C'), span('B')]);
+    await act(() => resolveText('C'));
+    assertLog(['A', 'C']);
+    expect(ReactNoop).toMatchRenderedOutput(
+      <>
+        <span prop="A" />
+        <span prop="C" />
+        <span prop="B" />
+      </>,
+    );
   });
 
+  // @gate enableLegacyCache
+  it('does not show the parent fallback if the inner fallback is not defined', async () => {
+    function Foo({showC}) {
+      Scheduler.log('Foo');
+      return (
+        <Suspense fallback={<Text text="Initial load..." />}>
+          <Suspense>
+            <AsyncText text="A" />
+            {showC ? <AsyncText text="C" /> : null}
+          </Suspense>
+          <Text text="B" />
+        </Suspense>
+      );
+    }
+
+    ReactNoop.render(<Foo />);
+    await waitForAll([
+      'Foo',
+      'Suspend! [A]',
+      'B',
+      // null
+    ]);
+    expect(ReactNoop).toMatchRenderedOutput(<span prop="B" />);
+
+    // Eventually we resolve and show the data.
+    await act(() => resolveText('A'));
+    assertLog(['A']);
+    expect(ReactNoop).toMatchRenderedOutput(
+      <>
+        <span prop="A" />
+        <span prop="B" />
+      </>,
+    );
+
+    // Update to show C
+    ReactNoop.render(<Foo showC={true} />);
+    await waitForAll([
+      'Foo',
+      'A',
+      'Suspend! [C]',
+      // null
+      'B',
+    ]);
+    // Flush to skip suspended time.
+    Scheduler.unstable_advanceTime(600);
+    await advanceTimers(600);
+    expect(ReactNoop).toMatchRenderedOutput(
+      <>
+        <span prop="A" hidden={true} />
+        <span prop="B" />
+      </>,
+    );
+
+    // Later we load the data.
+    await act(() => resolveText('C'));
+    assertLog(['A', 'C']);
+    expect(ReactNoop).toMatchRenderedOutput(
+      <>
+        <span prop="A" />
+        <span prop="C" />
+        <span prop="B" />
+      </>,
+    );
+  });
+
+  // @gate enableLegacyCache
   it('favors showing the inner fallback for nested top level avoided fallback', async () => {
     function Foo({showB}) {
-      Scheduler.unstable_yieldValue('Foo');
+      Scheduler.log('Foo');
       return (
         <Suspense
           unstable_avoidThisFallback={true}
@@ -2192,29 +2188,30 @@ describe('ReactSuspenseWithNoopRenderer', () => {
           <Suspense
             unstable_avoidThisFallback={true}
             fallback={<Text text="Loading B..." />}>
-            <AsyncText text="B" ms={5000} />
+            <AsyncText text="B" />
           </Suspense>
         </Suspense>
       );
     }
 
     ReactNoop.render(<Foo />);
-    expect(Scheduler).toFlushAndYield([
-      'Foo',
-      'A',
-      'Suspend! [B]',
-      'Loading B...',
-    ]);
+    await waitForAll(['Foo', 'A', 'Suspend! [B]', 'Loading B...']);
     // Flush to skip suspended time.
     Scheduler.unstable_advanceTime(600);
     await advanceTimers(600);
 
-    expect(ReactNoop.getChildren()).toEqual([span('A'), span('Loading B...')]);
+    expect(ReactNoop).toMatchRenderedOutput(
+      <>
+        <span prop="A" />
+        <span prop="Loading B..." />
+      </>,
+    );
   });
 
+  // @gate enableLegacyCache && enableSuspenseAvoidThisFallback
   it('keeps showing an avoided parent fallback if it is already showing', async () => {
     function Foo({showB}) {
-      Scheduler.unstable_yieldValue('Foo');
+      Scheduler.log('Foo');
       return (
         <Suspense fallback={<Text text="Initial load..." />}>
           <Suspense
@@ -2225,7 +2222,7 @@ describe('ReactSuspenseWithNoopRenderer', () => {
               <Suspense
                 unstable_avoidThisFallback={true}
                 fallback={<Text text="Loading B..." />}>
-                <AsyncText text="B" ms={5000} />
+                <AsyncText text="B" />
               </Suspense>
             ) : null}
           </Suspense>
@@ -2234,121 +2231,102 @@ describe('ReactSuspenseWithNoopRenderer', () => {
     }
 
     ReactNoop.render(<Foo />);
-    expect(Scheduler).toFlushAndYield(['Foo', 'A']);
-    expect(ReactNoop.getChildren()).toEqual([span('A')]);
+    await waitForAll(['Foo', 'A']);
+    expect(ReactNoop).toMatchRenderedOutput(<span prop="A" />);
 
-    ReactNoop.render(<Foo showB={true} />);
+    React.startTransition(() => {
+      ReactNoop.render(<Foo showB={true} />);
+    });
 
-    expect(Scheduler).toFlushAndYield([
-      'Foo',
-      'A',
-      'Suspend! [B]',
-      'Loading B...',
-    ]);
-    // Still suspended.
-    expect(ReactNoop.getChildren()).toEqual([span('A')]);
+    await waitForAll(['Foo', 'A', 'Suspend! [B]', 'Loading B...']);
 
-    // Flush to skip suspended time.
-    Scheduler.unstable_advanceTime(600);
-    await advanceTimers(600);
-
-    expect(ReactNoop.getChildren()).toEqual([span('A'), span('Loading B...')]);
+    // Transitions never fall back.
+    expect(ReactNoop).toMatchRenderedOutput(<span prop="A" />);
   });
 
-  it('commits a suspended idle pri render within a reasonable time', async () => {
-    function Foo({renderContent}) {
+  // @gate enableLegacyCache
+  it('keeps showing an undefined fallback if it is already showing', async () => {
+    function Foo({showB}) {
+      Scheduler.log('Foo');
       return (
-        <Fragment>
-          <Suspense fallback={<Text text="Loading A..." />}>
-            {renderContent ? <AsyncText text="A" ms={10000} /> : null}
+        <Suspense fallback={<Text text="Initial load..." />}>
+          <Suspense fallback={undefined}>
+            <Text text="A" />
+            {showB ? (
+              <Suspense fallback={undefined}>
+                <AsyncText text="B" />
+              </Suspense>
+            ) : null}
           </Suspense>
-        </Fragment>
+        </Suspense>
       );
     }
 
     ReactNoop.render(<Foo />);
-    expect(Scheduler).toFlushAndYield([]);
+    await waitForAll(['Foo', 'A']);
+    expect(ReactNoop).toMatchRenderedOutput(<span prop="A" />);
 
-    ReactNoop.render(<Foo renderContent={1} />);
+    React.startTransition(() => {
+      ReactNoop.render(<Foo showB={true} />);
+    });
 
-    // Took a long time to render. This is to ensure we get a long suspense time.
-    // Could also use something like startTransition to simulate this.
-    Scheduler.unstable_advanceTime(1500);
-    await advanceTimers(1500);
-
-    expect(Scheduler).toFlushAndYield(['Suspend! [A]', 'Loading A...']);
-    // We're still suspended.
-    expect(ReactNoop.getChildren()).toEqual([]);
-
-    // Schedule an update at idle pri.
-    Scheduler.unstable_runWithPriority(Scheduler.unstable_IdlePriority, () =>
-      ReactNoop.render(<Foo renderContent={2} />),
-    );
-    // We won't even work on Idle priority.
-    expect(Scheduler).toFlushAndYield([]);
-
-    // We're still suspended.
-    expect(ReactNoop.getChildren()).toEqual([]);
-
-    // Advance time a little bit.
-    Scheduler.unstable_advanceTime(150);
-    await advanceTimers(150);
-
-    // We should not have committed yet because we had a long suspense time.
-    expect(ReactNoop.getChildren()).toEqual([]);
+    await waitForAll([
+      'Foo',
+      'A',
+      'Suspend! [B]',
+      // Null
+    ]);
+    // Still suspended.
+    expect(ReactNoop).toMatchRenderedOutput(<span prop="A" />);
 
     // Flush to skip suspended time.
     Scheduler.unstable_advanceTime(600);
     await advanceTimers(600);
 
-    expect(ReactNoop.getChildren()).toEqual([span('Loading A...')]);
+    expect(ReactNoop).toMatchRenderedOutput(<span prop="A" />);
   });
 
   describe('startTransition', () => {
-    // @gate experimental
+    // @gate enableLegacyCache
     it('top level render', async () => {
       function App({page}) {
         return (
           <Suspense fallback={<Text text="Loading..." />}>
-            <AsyncText text={page} ms={5000} />
+            <AsyncText text={page} />
           </Suspense>
         );
       }
 
       // Initial render.
-      React.unstable_startTransition(() => ReactNoop.render(<App page="A" />));
+      React.startTransition(() => ReactNoop.render(<App page="A" />));
 
-      expect(Scheduler).toFlushAndYield(['Suspend! [A]', 'Loading...']);
+      await waitForAll(['Suspend! [A]', 'Loading...']);
       // Only a short time is needed to unsuspend the initial loading state.
       Scheduler.unstable_advanceTime(400);
       await advanceTimers(400);
-      expect(ReactNoop.getChildren()).toEqual([span('Loading...')]);
+      expect(ReactNoop).toMatchRenderedOutput(<span prop="Loading..." />);
 
       // Later we load the data.
-      Scheduler.unstable_advanceTime(5000);
-      await advanceTimers(5000);
-      expect(Scheduler).toHaveYielded(['Promise resolved [A]']);
-      expect(Scheduler).toFlushAndYield(['A']);
-      expect(ReactNoop.getChildren()).toEqual([span('A')]);
+      await act(() => resolveText('A'));
+      assertLog(['A']);
+      expect(ReactNoop).toMatchRenderedOutput(<span prop="A" />);
 
       // Start transition.
-      React.unstable_startTransition(() => ReactNoop.render(<App page="B" />));
+      React.startTransition(() => ReactNoop.render(<App page="B" />));
 
-      expect(Scheduler).toFlushAndYield(['Suspend! [B]', 'Loading...']);
+      await waitForAll(['Suspend! [B]', 'Loading...']);
       Scheduler.unstable_advanceTime(100000);
       await advanceTimers(100000);
       // Even after lots of time has passed, we have still not yet flushed the
       // loading state.
-      expect(ReactNoop.getChildren()).toEqual([span('A')]);
+      expect(ReactNoop).toMatchRenderedOutput(<span prop="A" />);
       // Later we load the data.
-      Scheduler.unstable_advanceTime(3000);
-      await advanceTimers(3000);
-      expect(Scheduler).toHaveYielded(['Promise resolved [B]']);
-      expect(Scheduler).toFlushAndYield(['B']);
-      expect(ReactNoop.getChildren()).toEqual([span('B')]);
+      await act(() => resolveText('B'));
+      assertLog(['B']);
+      expect(ReactNoop).toMatchRenderedOutput(<span prop="B" />);
     });
 
-    // @gate experimental
+    // @gate enableLegacyCache
     it('hooks', async () => {
       let transitionToPage;
       function App() {
@@ -2365,44 +2343,42 @@ describe('ReactSuspenseWithNoopRenderer', () => {
       }
 
       ReactNoop.render(<App />);
-      expect(Scheduler).toFlushAndYield([]);
+      await waitForAll([]);
 
       // Initial render.
-      await ReactNoop.act(async () => {
-        React.unstable_startTransition(() => transitionToPage('A'));
+      await act(async () => {
+        React.startTransition(() => transitionToPage('A'));
 
-        expect(Scheduler).toFlushAndYield(['Suspend! [A]', 'Loading...']);
+        await waitForAll(['Suspend! [A]', 'Loading...']);
         // Only a short time is needed to unsuspend the initial loading state.
         Scheduler.unstable_advanceTime(400);
         await advanceTimers(400);
-        expect(ReactNoop.getChildren()).toEqual([span('Loading...')]);
+        expect(ReactNoop).toMatchRenderedOutput(<span prop="Loading..." />);
       });
 
       // Later we load the data.
-      await resolveText('A');
-      expect(Scheduler).toHaveYielded(['Promise resolved [A]']);
-      expect(Scheduler).toFlushAndYield(['A']);
-      expect(ReactNoop.getChildren()).toEqual([span('A')]);
+      await act(() => resolveText('A'));
+      assertLog(['A']);
+      expect(ReactNoop).toMatchRenderedOutput(<span prop="A" />);
 
       // Start transition.
-      await ReactNoop.act(async () => {
-        React.unstable_startTransition(() => transitionToPage('B'));
+      await act(async () => {
+        React.startTransition(() => transitionToPage('B'));
 
-        expect(Scheduler).toFlushAndYield(['Suspend! [B]', 'Loading...']);
+        await waitForAll(['Suspend! [B]', 'Loading...']);
         Scheduler.unstable_advanceTime(100000);
         await advanceTimers(100000);
         // Even after lots of time has passed, we have still not yet flushed the
         // loading state.
-        expect(ReactNoop.getChildren()).toEqual([span('A')]);
+        expect(ReactNoop).toMatchRenderedOutput(<span prop="A" />);
       });
       // Later we load the data.
-      await resolveText('B');
-      expect(Scheduler).toHaveYielded(['Promise resolved [B]']);
-      expect(Scheduler).toFlushAndYield(['B']);
-      expect(ReactNoop.getChildren()).toEqual([span('B')]);
+      await act(() => resolveText('B'));
+      assertLog(['B']);
+      expect(ReactNoop).toMatchRenderedOutput(<span prop="B" />);
     });
 
-    // @gate experimental
+    // @gate enableLegacyCache
     it('classes', async () => {
       let transitionToPage;
       class App extends React.Component {
@@ -2422,46 +2398,44 @@ describe('ReactSuspenseWithNoopRenderer', () => {
       }
 
       ReactNoop.render(<App />);
-      expect(Scheduler).toFlushAndYield([]);
+      await waitForAll([]);
 
       // Initial render.
-      await ReactNoop.act(async () => {
-        React.unstable_startTransition(() => transitionToPage('A'));
+      await act(async () => {
+        React.startTransition(() => transitionToPage('A'));
 
-        expect(Scheduler).toFlushAndYield(['Suspend! [A]', 'Loading...']);
+        await waitForAll(['Suspend! [A]', 'Loading...']);
         // Only a short time is needed to unsuspend the initial loading state.
         Scheduler.unstable_advanceTime(400);
         await advanceTimers(400);
-        expect(ReactNoop.getChildren()).toEqual([span('Loading...')]);
+        expect(ReactNoop).toMatchRenderedOutput(<span prop="Loading..." />);
       });
 
       // Later we load the data.
-      await resolveText('A');
-      expect(Scheduler).toHaveYielded(['Promise resolved [A]']);
-      expect(Scheduler).toFlushAndYield(['A']);
-      expect(ReactNoop.getChildren()).toEqual([span('A')]);
+      await act(() => resolveText('A'));
+      assertLog(['A']);
+      expect(ReactNoop).toMatchRenderedOutput(<span prop="A" />);
 
       // Start transition.
-      await ReactNoop.act(async () => {
-        React.unstable_startTransition(() => transitionToPage('B'));
+      await act(async () => {
+        React.startTransition(() => transitionToPage('B'));
 
-        expect(Scheduler).toFlushAndYield(['Suspend! [B]', 'Loading...']);
+        await waitForAll(['Suspend! [B]', 'Loading...']);
         Scheduler.unstable_advanceTime(100000);
         await advanceTimers(100000);
         // Even after lots of time has passed, we have still not yet flushed the
         // loading state.
-        expect(ReactNoop.getChildren()).toEqual([span('A')]);
+        expect(ReactNoop).toMatchRenderedOutput(<span prop="A" />);
       });
       // Later we load the data.
-      await resolveText('B');
-      expect(Scheduler).toHaveYielded(['Promise resolved [B]']);
-      expect(Scheduler).toFlushAndYield(['B']);
-      expect(ReactNoop.getChildren()).toEqual([span('B')]);
+      await act(() => resolveText('B'));
+      assertLog(['B']);
+      expect(ReactNoop).toMatchRenderedOutput(<span prop="B" />);
     });
   });
 
-  describe('delays transitions when using React.startTranistion', () => {
-    // @gate experimental
+  describe('delays transitions when using React.startTransition', () => {
+    // @gate enableLegacyCache
     it('top level render', async () => {
       function App({page}) {
         return (
@@ -2472,48 +2446,46 @@ describe('ReactSuspenseWithNoopRenderer', () => {
       }
 
       // Initial render.
-      React.unstable_startTransition(() => ReactNoop.render(<App page="A" />));
+      React.startTransition(() => ReactNoop.render(<App page="A" />));
 
-      expect(Scheduler).toFlushAndYield(['Suspend! [A]', 'Loading...']);
+      await waitForAll(['Suspend! [A]', 'Loading...']);
       // Only a short time is needed to unsuspend the initial loading state.
       Scheduler.unstable_advanceTime(400);
       await advanceTimers(400);
-      expect(ReactNoop.getChildren()).toEqual([span('Loading...')]);
+      expect(ReactNoop).toMatchRenderedOutput(<span prop="Loading..." />);
 
       // Later we load the data.
-      await resolveText('A');
-      expect(Scheduler).toHaveYielded(['Promise resolved [A]']);
-      expect(Scheduler).toFlushAndYield(['A']);
-      expect(ReactNoop.getChildren()).toEqual([span('A')]);
+      await act(() => resolveText('A'));
+      assertLog(['A']);
+      expect(ReactNoop).toMatchRenderedOutput(<span prop="A" />);
 
       // Start transition.
-      React.unstable_startTransition(() => ReactNoop.render(<App page="B" />));
+      React.startTransition(() => ReactNoop.render(<App page="B" />));
 
-      expect(Scheduler).toFlushAndYield(['Suspend! [B]', 'Loading...']);
+      await waitForAll(['Suspend! [B]', 'Loading...']);
       Scheduler.unstable_advanceTime(2999);
       await advanceTimers(2999);
       // Since the timeout is infinite (or effectively infinite),
       // we have still not yet flushed the loading state.
-      expect(ReactNoop.getChildren()).toEqual([span('A')]);
+      expect(ReactNoop).toMatchRenderedOutput(<span prop="A" />);
 
       // Later we load the data.
-      await resolveText('B');
-      expect(Scheduler).toHaveYielded(['Promise resolved [B]']);
-      expect(Scheduler).toFlushAndYield(['B']);
-      expect(ReactNoop.getChildren()).toEqual([span('B')]);
+      await act(() => resolveText('B'));
+      assertLog(['B']);
+      expect(ReactNoop).toMatchRenderedOutput(<span prop="B" />);
 
       // Start a long (infinite) transition.
-      React.unstable_startTransition(() => ReactNoop.render(<App page="C" />));
-      expect(Scheduler).toFlushAndYield(['Suspend! [C]', 'Loading...']);
+      React.startTransition(() => ReactNoop.render(<App page="C" />));
+      await waitForAll(['Suspend! [C]', 'Loading...']);
 
       // Even after lots of time has passed, we have still not yet flushed the
       // loading state.
       Scheduler.unstable_advanceTime(100000);
       await advanceTimers(100000);
-      expect(ReactNoop.getChildren()).toEqual([span('B')]);
+      expect(ReactNoop).toMatchRenderedOutput(<span prop="B" />);
     });
 
-    // @gate experimental
+    // @gate enableLegacyCache
     it('hooks', async () => {
       let transitionToPage;
       function App() {
@@ -2530,59 +2502,57 @@ describe('ReactSuspenseWithNoopRenderer', () => {
       }
 
       ReactNoop.render(<App />);
-      expect(Scheduler).toFlushAndYield([]);
+      await waitForAll([]);
 
       // Initial render.
-      await ReactNoop.act(async () => {
-        React.unstable_startTransition(() => transitionToPage('A'));
+      await act(async () => {
+        React.startTransition(() => transitionToPage('A'));
 
-        expect(Scheduler).toFlushAndYield(['Suspend! [A]', 'Loading...']);
+        await waitForAll(['Suspend! [A]', 'Loading...']);
         // Only a short time is needed to unsuspend the initial loading state.
         Scheduler.unstable_advanceTime(400);
         await advanceTimers(400);
-        expect(ReactNoop.getChildren()).toEqual([span('Loading...')]);
+        expect(ReactNoop).toMatchRenderedOutput(<span prop="Loading..." />);
       });
 
       // Later we load the data.
-      await resolveText('A');
-      expect(Scheduler).toHaveYielded(['Promise resolved [A]']);
-      expect(Scheduler).toFlushAndYield(['A']);
-      expect(ReactNoop.getChildren()).toEqual([span('A')]);
+      await act(() => resolveText('A'));
+      assertLog(['A']);
+      expect(ReactNoop).toMatchRenderedOutput(<span prop="A" />);
 
       // Start transition.
-      await ReactNoop.act(async () => {
-        React.unstable_startTransition(() => transitionToPage('B'));
+      await act(async () => {
+        React.startTransition(() => transitionToPage('B'));
 
-        expect(Scheduler).toFlushAndYield(['Suspend! [B]', 'Loading...']);
+        await waitForAll(['Suspend! [B]', 'Loading...']);
 
         Scheduler.unstable_advanceTime(2999);
         await advanceTimers(2999);
         // Since the timeout is infinite (or effectively infinite),
         // we have still not yet flushed the loading state.
-        expect(ReactNoop.getChildren()).toEqual([span('A')]);
+        expect(ReactNoop).toMatchRenderedOutput(<span prop="A" />);
       });
 
       // Later we load the data.
-      await resolveText('B');
-      expect(Scheduler).toHaveYielded(['Promise resolved [B]']);
-      expect(Scheduler).toFlushAndYield(['B']);
-      expect(ReactNoop.getChildren()).toEqual([span('B')]);
+      await act(() => resolveText('B'));
+      assertLog(['B']);
+      expect(ReactNoop).toMatchRenderedOutput(<span prop="B" />);
 
       // Start a long (infinite) transition.
-      await ReactNoop.act(async () => {
-        React.unstable_startTransition(() => transitionToPage('C'));
+      await act(async () => {
+        React.startTransition(() => transitionToPage('C'));
 
-        expect(Scheduler).toFlushAndYield(['Suspend! [C]', 'Loading...']);
+        await waitForAll(['Suspend! [C]', 'Loading...']);
 
         // Even after lots of time has passed, we have still not yet flushed the
         // loading state.
         Scheduler.unstable_advanceTime(100000);
         await advanceTimers(100000);
-        expect(ReactNoop.getChildren()).toEqual([span('B')]);
+        expect(ReactNoop).toMatchRenderedOutput(<span prop="B" />);
       });
     });
 
-    // @gate experimental
+    // @gate enableLegacyCache
     it('classes', async () => {
       let transitionToPage;
       class App extends React.Component {
@@ -2602,59 +2572,57 @@ describe('ReactSuspenseWithNoopRenderer', () => {
       }
 
       ReactNoop.render(<App />);
-      expect(Scheduler).toFlushAndYield([]);
+      await waitForAll([]);
 
       // Initial render.
-      await ReactNoop.act(async () => {
-        React.unstable_startTransition(() => transitionToPage('A'));
+      await act(async () => {
+        React.startTransition(() => transitionToPage('A'));
 
-        expect(Scheduler).toFlushAndYield(['Suspend! [A]', 'Loading...']);
+        await waitForAll(['Suspend! [A]', 'Loading...']);
         // Only a short time is needed to unsuspend the initial loading state.
         Scheduler.unstable_advanceTime(400);
         await advanceTimers(400);
-        expect(ReactNoop.getChildren()).toEqual([span('Loading...')]);
+        expect(ReactNoop).toMatchRenderedOutput(<span prop="Loading..." />);
       });
 
       // Later we load the data.
-      await resolveText('A');
-      expect(Scheduler).toHaveYielded(['Promise resolved [A]']);
-      expect(Scheduler).toFlushAndYield(['A']);
-      expect(ReactNoop.getChildren()).toEqual([span('A')]);
+      await act(() => resolveText('A'));
+      assertLog(['A']);
+      expect(ReactNoop).toMatchRenderedOutput(<span prop="A" />);
 
       // Start transition.
-      await ReactNoop.act(async () => {
-        React.unstable_startTransition(() => transitionToPage('B'));
+      await act(async () => {
+        React.startTransition(() => transitionToPage('B'));
 
-        expect(Scheduler).toFlushAndYield(['Suspend! [B]', 'Loading...']);
+        await waitForAll(['Suspend! [B]', 'Loading...']);
         Scheduler.unstable_advanceTime(2999);
         await advanceTimers(2999);
         // Since the timeout is infinite (or effectively infinite),
         // we have still not yet flushed the loading state.
-        expect(ReactNoop.getChildren()).toEqual([span('A')]);
+        expect(ReactNoop).toMatchRenderedOutput(<span prop="A" />);
       });
 
       // Later we load the data.
-      await resolveText('B');
-      expect(Scheduler).toHaveYielded(['Promise resolved [B]']);
-      expect(Scheduler).toFlushAndYield(['B']);
-      expect(ReactNoop.getChildren()).toEqual([span('B')]);
+      await act(() => resolveText('B'));
+      assertLog(['B']);
+      expect(ReactNoop).toMatchRenderedOutput(<span prop="B" />);
 
       // Start a long (infinite) transition.
-      await ReactNoop.act(async () => {
-        React.unstable_startTransition(() => transitionToPage('C'));
+      await act(async () => {
+        React.startTransition(() => transitionToPage('C'));
 
-        expect(Scheduler).toFlushAndYield(['Suspend! [C]', 'Loading...']);
+        await waitForAll(['Suspend! [C]', 'Loading...']);
 
         // Even after lots of time has passed, we have still not yet flushed the
         // loading state.
         Scheduler.unstable_advanceTime(100000);
         await advanceTimers(100000);
-        expect(ReactNoop.getChildren()).toEqual([span('B')]);
+        expect(ReactNoop).toMatchRenderedOutput(<span prop="B" />);
       });
     });
   });
 
-  // @gate experimental
+  // @gate enableLegacyCache && enableSuspenseAvoidThisFallback
   it('do not show placeholder when updating an avoided boundary with startTransition', async () => {
     function App({page}) {
       return (
@@ -2671,27 +2639,40 @@ describe('ReactSuspenseWithNoopRenderer', () => {
 
     // Initial render.
     ReactNoop.render(<App page="A" />);
-    expect(Scheduler).toFlushAndYield(['Hi!', 'Suspend! [A]', 'Loading...']);
-    await resolveText('A');
-    expect(Scheduler).toHaveYielded(['Promise resolved [A]']);
-    expect(Scheduler).toFlushAndYield(['Hi!', 'A']);
-    expect(ReactNoop.getChildren()).toEqual([span('Hi!'), span('A')]);
+    await waitForAll(['Hi!', 'Suspend! [A]', 'Loading...']);
+    await act(() => resolveText('A'));
+    assertLog(['Hi!', 'A']);
+    expect(ReactNoop).toMatchRenderedOutput(
+      <>
+        <span prop="Hi!" />
+        <span prop="A" />
+      </>,
+    );
 
     // Start transition.
-    React.unstable_startTransition(() => ReactNoop.render(<App page="B" />));
+    React.startTransition(() => ReactNoop.render(<App page="B" />));
 
-    expect(Scheduler).toFlushAndYield(['Hi!', 'Suspend! [B]', 'Loading B...']);
+    await waitForAll(['Hi!', 'Suspend! [B]', 'Loading B...']);
 
     // Suspended
-    expect(ReactNoop.getChildren()).toEqual([span('Hi!'), span('A')]);
+    expect(ReactNoop).toMatchRenderedOutput(
+      <>
+        <span prop="Hi!" />
+        <span prop="A" />
+      </>,
+    );
     Scheduler.unstable_advanceTime(1800);
     await advanceTimers(1800);
-    expect(Scheduler).toFlushAndYield([]);
+    await waitForAll([]);
     // We should still be suspended here because this loading state should be avoided.
-    expect(ReactNoop.getChildren()).toEqual([span('Hi!'), span('A')]);
+    expect(ReactNoop).toMatchRenderedOutput(
+      <>
+        <span prop="Hi!" />
+        <span prop="A" />
+      </>,
+    );
     await resolveText('B');
-    expect(Scheduler).toHaveYielded(['Promise resolved [B]']);
-    expect(Scheduler).toFlushAndYield(['Hi!', 'B']);
+    await waitForAll(['Hi!', 'B']);
     expect(ReactNoop).toMatchRenderedOutput(
       <>
         <span prop="Hi!" />
@@ -2700,7 +2681,7 @@ describe('ReactSuspenseWithNoopRenderer', () => {
     );
   });
 
-  // @gate experimental
+  // @gate enableLegacyCache && enableSuspenseAvoidThisFallback
   it('do not show placeholder when mounting an avoided boundary with startTransition', async () => {
     function App({page}) {
       return (
@@ -2721,19 +2702,29 @@ describe('ReactSuspenseWithNoopRenderer', () => {
 
     // Initial render.
     ReactNoop.render(<App page="A" />);
-    expect(Scheduler).toFlushAndYield(['Hi!', 'A']);
-    expect(ReactNoop.getChildren()).toEqual([span('Hi!'), span('A')]);
+    await waitForAll(['Hi!', 'A']);
+    expect(ReactNoop).toMatchRenderedOutput(
+      <>
+        <span prop="Hi!" />
+        <span prop="A" />
+      </>,
+    );
 
     // Start transition.
-    React.unstable_startTransition(() => ReactNoop.render(<App page="B" />));
+    React.startTransition(() => ReactNoop.render(<App page="B" />));
 
-    expect(Scheduler).toFlushAndYield(['Hi!', 'Suspend! [B]', 'Loading B...']);
+    await waitForAll(['Hi!', 'Suspend! [B]', 'Loading B...']);
 
     // Suspended
-    expect(ReactNoop.getChildren()).toEqual([span('Hi!'), span('A')]);
+    expect(ReactNoop).toMatchRenderedOutput(
+      <>
+        <span prop="Hi!" />
+        <span prop="A" />
+      </>,
+    );
     Scheduler.unstable_advanceTime(1800);
     await advanceTimers(1800);
-    expect(Scheduler).toFlushAndYield([]);
+    await waitForAll([]);
     // We should still be suspended here because this loading state should be avoided.
     expect(ReactNoop).toMatchRenderedOutput(
       <>
@@ -2742,57 +2733,13 @@ describe('ReactSuspenseWithNoopRenderer', () => {
       </>,
     );
     await resolveText('B');
-    expect(Scheduler).toHaveYielded(['Promise resolved [B]']);
-    expect(Scheduler).toFlushAndYield(['Hi!', 'B']);
+    await waitForAll(['Hi!', 'B']);
     expect(ReactNoop).toMatchRenderedOutput(
       <>
         <span prop="Hi!" />
         <span prop="B" />
       </>,
     );
-  });
-
-  // TODO: This test is specifically about avoided commits that suspend for a
-  // JND. We may remove this behavior.
-  it("suspended commit remains suspended even if there's another update at same expiration", async () => {
-    // Regression test
-    function App({text}) {
-      return (
-        <Suspense fallback="Loading...">
-          <AsyncText text={text} />
-        </Suspense>
-      );
-    }
-
-    const root = ReactNoop.createRoot();
-    await ReactNoop.act(async () => {
-      root.render(<App text="Initial" />);
-    });
-    expect(Scheduler).toHaveYielded(['Suspend! [Initial]']);
-
-    // Resolve initial render
-    await ReactNoop.act(async () => {
-      await resolveText('Initial');
-    });
-    expect(Scheduler).toHaveYielded(['Promise resolved [Initial]', 'Initial']);
-    expect(root).toMatchRenderedOutput(<span prop="Initial" />);
-
-    await ReactNoop.act(async () => {
-      // Update. Since showing a fallback would hide content that's already
-      // visible, it should suspend for a JND without committing.
-      root.render(<App text="First update" />);
-      expect(Scheduler).toFlushAndYield(['Suspend! [First update]']);
-
-      // Should not display a fallback
-      expect(root).toMatchRenderedOutput(<span prop="Initial" />);
-
-      // Update again. This should also suspend for a JND.
-      root.render(<App text="Second update" />);
-      expect(Scheduler).toFlushAndYield(['Suspend! [Second update]']);
-
-      // Should not display a fallback
-      expect(root).toMatchRenderedOutput(<span prop="Initial" />);
-    });
   });
 
   it('regression test: resets current "debug phase" after suspending', async () => {
@@ -2813,7 +2760,7 @@ describe('ReactSuspenseWithNoopRenderer', () => {
         foo = this;
 
         if (this.state.suspend) {
-          Scheduler.unstable_yieldValue('Suspend!');
+          Scheduler.log('Suspend!');
           throw thenable;
         }
 
@@ -2822,45 +2769,41 @@ describe('ReactSuspenseWithNoopRenderer', () => {
     }
 
     const root = ReactNoop.createRoot();
-    await ReactNoop.act(async () => {
+    await act(() => {
       root.render(<App />);
     });
 
-    expect(Scheduler).toHaveYielded(['Foo']);
+    assertLog(['Foo']);
 
-    await ReactNoop.act(async () => {
+    await act(async () => {
       foo.setState({suspend: true});
 
       // In the regression that this covers, we would neglect to reset the
       // current debug phase after suspending (in the catch block), so React
       // thinks we're still inside the render phase.
-      expect(Scheduler).toFlushAndYieldThrough(['Suspend!']);
+      await waitFor(['Suspend!']);
 
       // Then when this setState happens, React would incorrectly fire a warning
       // about updates that happen the render phase (only fired by classes).
       foo.setState({suspend: false});
     });
 
-    expect(Scheduler).toHaveYielded([
+    assertLog([
       // First setState
-      'Foo',
-      // Second setState. This update was scheduled while we were in the
-      // middle of rendering the previous update, so it was pushed to a separate
-      // batch to avoid invalidating the work-in-progress tree.
       'Foo',
     ]);
     expect(root).toMatchRenderedOutput(<span prop="Foo" />);
   });
 
-  // @gate experimental
+  // @gate enableLegacyCache && enableLegacyHidden
   it('should not render hidden content while suspended on higher pri', async () => {
     function Offscreen() {
-      Scheduler.unstable_yieldValue('Offscreen');
+      Scheduler.log('Offscreen');
       return 'Offscreen';
     }
     function App({showContent}) {
       React.useLayoutEffect(() => {
-        Scheduler.unstable_yieldValue('Commit');
+        Scheduler.log('Commit');
       });
       return (
         <>
@@ -2868,7 +2811,7 @@ describe('ReactSuspenseWithNoopRenderer', () => {
             <Offscreen />
           </LegacyHiddenDiv>
           <Suspense fallback={<Text text="Loading..." />}>
-            {showContent ? <AsyncText text="A" ms={2000} /> : null}
+            {showContent ? <AsyncText text="A" /> : null}
           </Suspense>
         </>
       );
@@ -2876,26 +2819,24 @@ describe('ReactSuspenseWithNoopRenderer', () => {
 
     // Initial render.
     ReactNoop.render(<App showContent={false} />);
-    expect(Scheduler).toFlushAndYieldThrough(['Commit']);
+    await waitFor(['Commit']);
     expect(ReactNoop).toMatchRenderedOutput(<div hidden={true} />);
 
     // Start transition.
-    React.unstable_startTransition(() => {
+    React.startTransition(() => {
       ReactNoop.render(<App showContent={true} />);
     });
 
-    expect(Scheduler).toFlushAndYield(['Suspend! [A]', 'Loading...']);
-    Scheduler.unstable_advanceTime(2000);
-    await advanceTimers(2000);
-    expect(Scheduler).toHaveYielded(['Promise resolved [A]']);
-    expect(Scheduler).toFlushAndYieldThrough(['A', 'Commit']);
+    await waitForAll(['Suspend! [A]', 'Loading...']);
+    await resolveText('A');
+    await waitFor(['A', 'Commit']);
     expect(ReactNoop).toMatchRenderedOutput(
       <>
         <div hidden={true} />
         <span prop="A" />
       </>,
     );
-    expect(Scheduler).toFlushAndYield(['Offscreen']);
+    await waitForAll(['Offscreen']);
     expect(ReactNoop).toMatchRenderedOutput(
       <>
         <div hidden={true}>Offscreen</div>
@@ -2904,52 +2845,50 @@ describe('ReactSuspenseWithNoopRenderer', () => {
     );
   });
 
-  // @gate experimental
+  // @gate enableLegacyCache && enableLegacyHidden
   it('should be able to unblock higher pri content before suspended hidden', async () => {
     function Offscreen() {
-      Scheduler.unstable_yieldValue('Offscreen');
+      Scheduler.log('Offscreen');
       return 'Offscreen';
     }
     function App({showContent}) {
       React.useLayoutEffect(() => {
-        Scheduler.unstable_yieldValue('Commit');
+        Scheduler.log('Commit');
       });
       return (
         <Suspense fallback={<Text text="Loading..." />}>
           <LegacyHiddenDiv mode="hidden">
-            <AsyncText text="A" ms={2000} />
+            <AsyncText text="A" />
             <Offscreen />
           </LegacyHiddenDiv>
-          {showContent ? <AsyncText text="A" ms={2000} /> : null}
+          {showContent ? <AsyncText text="A" /> : null}
         </Suspense>
       );
     }
 
     // Initial render.
     ReactNoop.render(<App showContent={false} />);
-    expect(Scheduler).toFlushAndYieldThrough(['Commit']);
+    await waitFor(['Commit']);
     expect(ReactNoop).toMatchRenderedOutput(<div hidden={true} />);
 
     // Partially render through the hidden content.
-    expect(Scheduler).toFlushAndYieldThrough(['Suspend! [A]']);
+    await waitFor(['Suspend! [A]']);
 
     // Start transition.
-    React.unstable_startTransition(() => {
+    React.startTransition(() => {
       ReactNoop.render(<App showContent={true} />);
     });
 
-    expect(Scheduler).toFlushAndYield(['Suspend! [A]', 'Loading...']);
-    Scheduler.unstable_advanceTime(2000);
-    await advanceTimers(2000);
-    expect(Scheduler).toHaveYielded(['Promise resolved [A]']);
-    expect(Scheduler).toFlushAndYieldThrough(['A', 'Commit']);
+    await waitForAll(['Suspend! [A]', 'Loading...']);
+    await resolveText('A');
+    await waitFor(['A', 'Commit']);
     expect(ReactNoop).toMatchRenderedOutput(
       <>
         <div hidden={true} />
         <span prop="A" />
       </>,
     );
-    expect(Scheduler).toFlushAndYield(['A', 'Offscreen']);
+    await waitForAll(['A', 'Offscreen']);
     expect(ReactNoop).toMatchRenderedOutput(
       <>
         <div hidden={true}>
@@ -2961,6 +2900,7 @@ describe('ReactSuspenseWithNoopRenderer', () => {
     );
   });
 
+  // @gate enableLegacyCache
   it(
     'multiple updates originating inside a Suspense boundary at different ' +
       'priority levels are not dropped',
@@ -2985,25 +2925,31 @@ describe('ReactSuspenseWithNoopRenderer', () => {
         return <AsyncText text={text} />;
       }
 
-      await resolveText('A');
-      await ReactNoop.act(async () => {
+      await seedNextTextCache('A');
+      await act(() => {
         root.render(<Parent />);
       });
-      expect(Scheduler).toHaveYielded(['A']);
+      assertLog(['A']);
       expect(root).toMatchRenderedOutput(<span prop="A" />);
 
-      await ReactNoop.act(async () => {
+      await act(async () => {
         // Schedule two updates that originate inside the Suspense boundary.
         // The first one causes the boundary to suspend. The second one is at
         // lower priority and unsuspends the tree.
         ReactNoop.discreteUpdates(() => {
           setText('B');
         });
-        // Update to a value that has already resolved
+        startTransition(() => {
+          setText('C');
+        });
+        // Assert that neither update has happened yet. Both the high pri and
+        // low pri updates are in the queue.
+        assertLog([]);
+
+        // Resolve this before starting to render so that C doesn't suspend.
         await resolveText('C');
-        setText('C');
       });
-      expect(Scheduler).toHaveYielded([
+      assertLog([
         // First we attempt the high pri update. It suspends.
         'Suspend! [B]',
         'Loading...',
@@ -3014,6 +2960,7 @@ describe('ReactSuspenseWithNoopRenderer', () => {
     },
   );
 
+  // @gate enableLegacyCache
   it(
     'multiple updates originating inside a Suspense boundary at different ' +
       'priority levels are not dropped, including Idle updates',
@@ -3038,35 +2985,26 @@ describe('ReactSuspenseWithNoopRenderer', () => {
         return <AsyncText text={text} />;
       }
 
-      await resolveText('A');
-      await ReactNoop.act(async () => {
+      await seedNextTextCache('A');
+      await act(() => {
         root.render(<Parent />);
       });
-      expect(Scheduler).toHaveYielded(['A']);
+      assertLog(['A']);
       expect(root).toMatchRenderedOutput(<span prop="A" />);
 
-      await ReactNoop.act(async () => {
+      await act(async () => {
         // Schedule two updates that originate inside the Suspense boundary.
         // The first one causes the boundary to suspend. The second one is at
         // lower priority and unsuspends it by hiding the async component.
         setText('B');
 
         await resolveText('C');
-        Scheduler.unstable_runWithPriority(
-          Scheduler.unstable_IdlePriority,
-          () => {
-            setText('C');
-          },
-        );
+        ReactNoop.idleUpdates(() => {
+          setText('C');
+        });
 
-        expect(Scheduler).toFlushAndYield([
-          // First we attempt the high pri update. It suspends.
-          'Suspend! [B]',
-          'Loading...',
-        ]);
-
-        // Commit the placeholder to unblock the Idle update.
-        await advanceTimers(250);
+        // First we attempt the high pri update. It suspends.
+        await waitForPaint(['Suspend! [B]', 'Loading...']);
         expect(root).toMatchRenderedOutput(
           <>
             <span hidden={true} prop="A" />
@@ -3075,12 +3013,13 @@ describe('ReactSuspenseWithNoopRenderer', () => {
         );
 
         // Now flush the remaining work. The Idle update successfully finishes.
-        expect(Scheduler).toFlushAndYield(['C']);
+        await waitForAll(['C']);
         expect(root).toMatchRenderedOutput(<span prop="C" />);
       });
     },
   );
 
+  // @gate enableLegacyCache
   it(
     'fallback component can update itself even after a high pri update to ' +
       'the primary tree suspends',
@@ -3109,62 +3048,63 @@ describe('ReactSuspenseWithNoopRenderer', () => {
       }
 
       // Resolve the initial tree
-      await resolveText('A');
-      await ReactNoop.act(async () => {
+      await seedNextTextCache('A');
+      await act(() => {
         root.render(<App />);
       });
-      expect(Scheduler).toHaveYielded(['A']);
+      assertLog(['A']);
       expect(root).toMatchRenderedOutput(<span prop="A" />);
 
-      await ReactNoop.act(async () => {
+      await act(async () => {
         // Schedule an update inside the Suspense boundary that suspends.
         setAppText('B');
-        expect(Scheduler).toFlushAndYield(['Suspend! [B]', 'Loading...']);
-
-        // Commit the placeholder
-        await advanceTimers(250);
-        expect(root).toMatchRenderedOutput(
-          <>
-            <span hidden={true} prop="A" />
-            <span prop="Loading..." />
-          </>,
-        );
-
-        // Schedule a high pri update on the boundary, and a lower pri update
-        // on the fallback. We're testing to make sure the fallback can still
-        // update even though the primary tree is suspended.{
-        ReactNoop.discreteUpdates(() => {
-          setAppText('C');
-        });
-        setFallbackText('Still loading...');
-
-        expect(Scheduler).toFlushAndYield([
-          // First try to render the high pri update. Still suspended.
-          'Suspend! [C]',
-          'Loading...',
-
-          // In the expiration times model, once the high pri update suspends,
-          // we can't be sure if there's additional work at a lower priority
-          // that might unblock the tree. We do know that there's a lower
-          // priority update *somehwere* in the entire root, though (the update
-          // to the fallback). So we try rendering one more time, just in case.
-          // TODO: We shouldn't need to do this with lanes, because we always
-          // know exactly which lanes have pending work in each tree.
-          'Suspend! [C]',
-
-          // Then complete the update to the fallback.
-          'Still loading...',
-        ]);
-        expect(root).toMatchRenderedOutput(
-          <>
-            <span hidden={true} prop="A" />
-            <span prop="Still loading..." />
-          </>,
-        );
+        await waitForAll(['Suspend! [B]', 'Loading...']);
       });
+
+      expect(root).toMatchRenderedOutput(
+        <>
+          <span hidden={true} prop="A" />
+          <span prop="Loading..." />
+        </>,
+      );
+
+      // Schedule a default pri update on the boundary, and a lower pri update
+      // on the fallback. We're testing to make sure the fallback can still
+      // update even though the primary tree is suspended.
+      await act(() => {
+        setAppText('C');
+        React.startTransition(() => {
+          setFallbackText('Still loading...');
+        });
+      });
+
+      assertLog([
+        // First try to render the high pri update. Still suspended.
+        'Suspend! [C]',
+        'Loading...',
+
+        // In the expiration times model, once the high pri update suspends,
+        // we can't be sure if there's additional work at a lower priority
+        // that might unblock the tree. We do know that there's a lower
+        // priority update *somewhere* in the entire root, though (the update
+        // to the fallback). So we try rendering one more time, just in case.
+        // TODO: We shouldn't need to do this with lanes, because we always
+        // know exactly which lanes have pending work in each tree.
+        'Suspend! [C]',
+
+        // Then complete the update to the fallback.
+        'Still loading...',
+      ]);
+      expect(root).toMatchRenderedOutput(
+        <>
+          <span hidden={true} prop="A" />
+          <span prop="Still loading..." />
+        </>,
+      );
     },
   );
 
+  // @gate enableLegacyCache
   it(
     'regression: primary fragment fiber is not always part of setState ' +
       'return path',
@@ -3193,32 +3133,32 @@ describe('ReactSuspenseWithNoopRenderer', () => {
       }
 
       // Mount an initial tree. Resolve A so that it doesn't suspend.
-      await resolveText('A');
-      await ReactNoop.act(async () => {
+      await seedNextTextCache('A');
+      await act(() => {
         root.render(<Parent />);
       });
-      expect(Scheduler).toHaveYielded(['A']);
+      assertLog(['A']);
       // At this point, the setState return path follows current fiber.
       expect(root).toMatchRenderedOutput(<span prop="A" />);
 
       // Schedule another update. This will "flip" the alternate pairs.
       await resolveText('B');
-      await ReactNoop.act(async () => {
+      await act(() => {
         setText('B');
       });
-      expect(Scheduler).toHaveYielded(['B']);
+      assertLog(['B']);
       // Now the setState return path follows the *alternate* fiber.
       expect(root).toMatchRenderedOutput(<span prop="B" />);
 
       // Schedule another update. This time, we'll suspend.
-      await ReactNoop.act(async () => {
+      await act(() => {
         setText('C');
       });
-      expect(Scheduler).toHaveYielded(['Suspend! [C]', 'Loading...']);
+      assertLog(['Suspend! [C]', 'Loading...']);
 
       // Commit. This will insert a fragment fiber to wrap around the component
       // that triggered the update.
-      await ReactNoop.act(async () => {
+      await act(async () => {
         await advanceTimers(250);
       });
       // The fragment fiber is part of the current tree, but the setState return
@@ -3233,16 +3173,17 @@ describe('ReactSuspenseWithNoopRenderer', () => {
 
       // Update again. This should unsuspend the tree.
       await resolveText('D');
-      await ReactNoop.act(async () => {
+      await act(() => {
         setText('D');
       });
       // Even though the fragment fiber is not part of the return path, we should
       // be able to finish rendering.
-      expect(Scheduler).toHaveYielded(['D']);
+      assertLog(['D']);
       expect(root).toMatchRenderedOutput(<span prop="D" />);
     },
   );
 
+  // @gate enableLegacyCache
   it(
     'regression: primary fragment fiber is not always part of setState ' +
       'return path (another case)',
@@ -3269,32 +3210,32 @@ describe('ReactSuspenseWithNoopRenderer', () => {
       }
 
       // Mount an initial tree. Resolve A so that it doesn't suspend.
-      await resolveText('A');
-      await ReactNoop.act(async () => {
+      await seedNextTextCache('A');
+      await act(() => {
         root.render(<Parent />);
       });
-      expect(Scheduler).toHaveYielded(['A']);
+      assertLog(['A']);
       // At this point, the setState return path follows current fiber.
       expect(root).toMatchRenderedOutput(<span prop="A" />);
 
       // Schedule another update. This will "flip" the alternate pairs.
       await resolveText('B');
-      await ReactNoop.act(async () => {
+      await act(() => {
         setText('B');
       });
-      expect(Scheduler).toHaveYielded(['B']);
+      assertLog(['B']);
       // Now the setState return path follows the *alternate* fiber.
       expect(root).toMatchRenderedOutput(<span prop="B" />);
 
       // Schedule another update. This time, we'll suspend.
-      await ReactNoop.act(async () => {
+      await act(() => {
         setText('C');
       });
-      expect(Scheduler).toHaveYielded(['Suspend! [C]', 'Loading...']);
+      assertLog(['Suspend! [C]', 'Loading...']);
 
       // Commit. This will insert a fragment fiber to wrap around the component
       // that triggered the update.
-      await ReactNoop.act(async () => {
+      await act(async () => {
         await advanceTimers(250);
       });
       // The fragment fiber is part of the current tree, but the setState return
@@ -3307,26 +3248,24 @@ describe('ReactSuspenseWithNoopRenderer', () => {
         </>,
       );
 
-      await ReactNoop.act(async () => {
+      await act(async () => {
         // Schedule a normal pri update. This will suspend again.
         setText('D');
 
         // And another update at lower priority. This will unblock.
         await resolveText('E');
-        Scheduler.unstable_runWithPriority(
-          Scheduler.unstable_IdlePriority,
-          () => {
-            setText('E');
-          },
-        );
+        ReactNoop.idleUpdates(() => {
+          setText('E');
+        });
       });
       // Even though the fragment fiber is not part of the return path, we should
       // be able to finish rendering.
-      expect(Scheduler).toHaveYielded(['Suspend! [D]', 'E']);
+      assertLog(['Suspend! [D]', 'E']);
       expect(root).toMatchRenderedOutput(<span prop="E" />);
     },
   );
 
+  // @gate enableLegacyCache
   it(
     'after showing fallback, should not flip back to primary content until ' +
       'the update that suspended finishes',
@@ -3357,11 +3296,9 @@ describe('ReactSuspenseWithNoopRenderer', () => {
         // This will log if the component commits in an inconsistent state
         useEffect(() => {
           if (text === outerText) {
-            Scheduler.unstable_yieldValue('Commit Child');
+            Scheduler.log('Commit Child');
           } else {
-            Scheduler.unstable_yieldValue(
-              'FIXME: Texts are inconsistent (tearing)',
-            );
+            Scheduler.log('FIXME: Texts are inconsistent (tearing)');
           }
         }, [text, outerText]);
 
@@ -3380,11 +3317,11 @@ describe('ReactSuspenseWithNoopRenderer', () => {
       }
 
       // Mount an initial tree. Resolve A so that it doesn't suspend.
-      await resolveText('Inner text: A');
-      await ReactNoop.act(async () => {
+      await seedNextTextCache('Inner text: A');
+      await act(() => {
         root.render(<Parent step={0} />);
       });
-      expect(Scheduler).toHaveYielded([
+      assertLog([
         'Outer text: A',
         'Outer step: 0',
         'Inner text: A',
@@ -3401,14 +3338,13 @@ describe('ReactSuspenseWithNoopRenderer', () => {
       );
 
       // Update. This causes the inner component to suspend.
-      await ReactNoop.act(async () => {
+      await act(() => {
         setText('B');
       });
-      expect(Scheduler).toHaveYielded([
+      assertLog([
         'Outer text: B',
         'Outer step: 0',
         'Suspend! [Inner text: B]',
-        'Inner step: 0',
         'Loading...',
       ]);
       // Commit the placeholder
@@ -3424,7 +3360,7 @@ describe('ReactSuspenseWithNoopRenderer', () => {
       );
 
       // Schedule a high pri update on the parent.
-      await ReactNoop.act(async () => {
+      await act(() => {
         ReactNoop.discreteUpdates(() => {
           root.render(<Parent step={1} />);
         });
@@ -3433,11 +3369,10 @@ describe('ReactSuspenseWithNoopRenderer', () => {
       // Only the outer part can update. The inner part should still show a
       // fallback because we haven't finished loading B yet. Otherwise, the
       // inner text would be inconsistent with the outer text.
-      expect(Scheduler).toHaveYielded([
+      assertLog([
         'Outer text: B',
         'Outer step: 1',
         'Suspend! [Inner text: B]',
-        'Inner step: 1',
         'Loading...',
       ]);
       expect(root).toMatchRenderedOutput(
@@ -3451,15 +3386,10 @@ describe('ReactSuspenseWithNoopRenderer', () => {
       );
 
       // Now finish resolving the inner text
-      await ReactNoop.act(async () => {
+      await act(async () => {
         await resolveText('Inner text: B');
       });
-      expect(Scheduler).toHaveYielded([
-        'Promise resolved [Inner text: B]',
-        'Inner text: B',
-        'Inner step: 1',
-        'Commit Child',
-      ]);
+      assertLog(['Inner text: B', 'Inner step: 1', 'Commit Child']);
       expect(root).toMatchRenderedOutput(
         <>
           <span prop="Outer text: B" />
@@ -3471,6 +3401,7 @@ describe('ReactSuspenseWithNoopRenderer', () => {
     },
   );
 
+  // @gate enableLegacyCache
   it('a high pri update can unhide a boundary that suspended at a different level', async () => {
     const {useState, useEffect} = React;
     const root = ReactNoop.createRoot();
@@ -3497,11 +3428,9 @@ describe('ReactSuspenseWithNoopRenderer', () => {
       // This will log if the component commits in an inconsistent state
       useEffect(() => {
         if (text === outerText) {
-          Scheduler.unstable_yieldValue('Commit Child');
+          Scheduler.log('Commit Child');
         } else {
-          Scheduler.unstable_yieldValue(
-            'FIXME: Texts are inconsistent (tearing)',
-          );
+          Scheduler.log('FIXME: Texts are inconsistent (tearing)');
         }
       }, [text, outerText]);
 
@@ -3519,11 +3448,11 @@ describe('ReactSuspenseWithNoopRenderer', () => {
     }
 
     // Mount an initial tree. Resolve A so that it doesn't suspend.
-    await resolveText('Inner: A0');
-    await ReactNoop.act(async () => {
+    await seedNextTextCache('Inner: A0');
+    await act(() => {
       root.render(<Parent step={0} />);
     });
-    expect(Scheduler).toHaveYielded(['Outer: A0', 'Inner: A0', 'Commit Child']);
+    assertLog(['Outer: A0', 'Inner: A0', 'Commit Child']);
     expect(root).toMatchRenderedOutput(
       <>
         <span prop="Outer: A0" />
@@ -3532,14 +3461,10 @@ describe('ReactSuspenseWithNoopRenderer', () => {
     );
 
     // Update. This causes the inner component to suspend.
-    await ReactNoop.act(async () => {
+    await act(() => {
       setText('B');
     });
-    expect(Scheduler).toHaveYielded([
-      'Outer: B0',
-      'Suspend! [Inner: B0]',
-      'Loading...',
-    ]);
+    assertLog(['Outer: B0', 'Suspend! [Inner: B0]', 'Loading...']);
     // Commit the placeholder
     await advanceTimers(250);
     expect(root).toMatchRenderedOutput(
@@ -3552,13 +3477,13 @@ describe('ReactSuspenseWithNoopRenderer', () => {
 
     // Schedule a high pri update on the parent. This will unblock the content.
     await resolveText('Inner: B1');
-    await ReactNoop.act(async () => {
+    await act(() => {
       ReactNoop.discreteUpdates(() => {
         root.render(<Parent step={1} />);
       });
     });
 
-    expect(Scheduler).toHaveYielded(['Outer: B1', 'Inner: B1', 'Commit Child']);
+    assertLog(['Outer: B1', 'Inner: B1', 'Commit Child']);
     expect(root).toMatchRenderedOutput(
       <>
         <span prop="Outer: B1" />
@@ -3567,57 +3492,9 @@ describe('ReactSuspenseWithNoopRenderer', () => {
     );
   });
 
-  it('regression: empty render at high priority causes update to be dropped', async () => {
-    // Reproduces a bug where flushDiscreteUpdates starts a new (empty) render
-    // pass which cancels a scheduled timeout and causes the fallback never to
-    // be committed.
-    function App({text, shouldSuspend}) {
-      return (
-        <>
-          <Text text={text} />
-          <Suspense fallback={<Text text="Loading..." />}>
-            {shouldSuspend && <AsyncText text="B" />}
-          </Suspense>
-        </>
-      );
-    }
-
-    const root = ReactNoop.createRoot();
-    ReactNoop.discreteUpdates(() => {
-      // High pri
-      root.render(<App text="A" />);
-    });
-    // Low pri
-    root.render(<App text="A" shouldSuspend={true} />);
-
-    expect(Scheduler).toFlushAndYield([
-      // Render the high pri update
-      'A',
-      // Render the low pri update
-      'A',
-      'Suspend! [B]',
-      'Loading...',
-    ]);
-    expect(root).toMatchRenderedOutput(<span prop="A" />);
-
-    // Triggers erstwhile bug where flushDiscreteUpdates caused an empty render
-    // at a previously committed level
-    ReactNoop.flushDiscreteUpdates();
-
-    // Commit the placeholder
-    Scheduler.unstable_advanceTime(2000);
-    await advanceTimers(2000);
-    expect(root).toMatchRenderedOutput(
-      <>
-        <span prop="A" />
-        <span prop="Loading..." />
-      </>,
-    );
-  });
-
-  // @gate experimental
+  // @gate enableLegacyCache
   it('regression: ping at high priority causes update to be dropped', async () => {
-    const {useState, unstable_useTransition: useTransition} = React;
+    const {useState, useTransition} = React;
 
     let setTextA;
     function A() {
@@ -3631,11 +3508,12 @@ describe('ReactSuspenseWithNoopRenderer', () => {
     }
 
     let setTextB;
-    let startTransition;
+    let startTransitionFromB;
     function B() {
       const [textB, _setTextB] = useState('B');
-      const [_startTransition] = useTransition({timeoutMs: 10000});
-      startTransition = _startTransition;
+      // eslint-disable-next-line no-unused-vars
+      const [_, _startTransition] = useTransition();
+      startTransitionFromB = _startTransition;
       setTextB = _setTextB;
       return (
         <Suspense fallback={<Text text="Loading..." />}>
@@ -3654,12 +3532,12 @@ describe('ReactSuspenseWithNoopRenderer', () => {
     }
 
     const root = ReactNoop.createRoot();
-    await ReactNoop.act(async () => {
-      await resolveText('A');
-      await resolveText('B');
+    await act(async () => {
+      await seedNextTextCache('A');
+      await seedNextTextCache('B');
       root.render(<App />);
     });
-    expect(Scheduler).toHaveYielded(['A', 'B']);
+    assertLog(['A', 'B']);
     expect(root).toMatchRenderedOutput(
       <>
         <span prop="A" />
@@ -3667,11 +3545,11 @@ describe('ReactSuspenseWithNoopRenderer', () => {
       </>,
     );
 
-    await ReactNoop.act(async () => {
+    await act(async () => {
       // Triggers suspense at normal pri
       setTextA('A1');
       // Triggers in an unrelated tree at a different pri
-      startTransition(() => {
+      startTransitionFromB(() => {
         // Update A again so that it doesn't suspend on A1. That way we can ping
         // the A1 update without also pinging this one. This is a workaround
         // because there's currently no way to render at a lower priority (B2)
@@ -3680,11 +3558,10 @@ describe('ReactSuspenseWithNoopRenderer', () => {
         setTextB('B2');
       });
 
-      expect(Scheduler).toFlushAndYield([
-        'B',
+      await waitFor([
         'Suspend! [A1]',
         'Loading...',
-
+        'B',
         'Suspend! [A2]',
         'Loading...',
         'Suspend! [B2]',
@@ -3692,36 +3569,28 @@ describe('ReactSuspenseWithNoopRenderer', () => {
       ]);
       expect(root).toMatchRenderedOutput(
         <>
-          <span prop="A" />
+          <span hidden={true} prop="A" />
+          <span prop="Loading..." />
           <span prop="B" />
         </>,
       );
 
       await resolveText('A1');
-      expect(Scheduler).toHaveYielded(['Promise resolved [A1]']);
-      expect(Scheduler).toFlushAndYield([
-        'A1',
-        'Suspend! [A2]',
-        'Loading...',
-        'Suspend! [B2]',
-        'Loading...',
-      ]);
-      expect(root).toMatchRenderedOutput(
-        <>
-          <span prop="A1" />
-          <span prop="B" />
-        </>,
-      );
+      await waitFor(['A1']);
+    });
+    assertLog(['Suspend! [A2]', 'Loading...', 'Suspend! [B2]', 'Loading...']);
+    expect(root).toMatchRenderedOutput(
+      <>
+        <span prop="A1" />
+        <span prop="B" />
+      </>,
+    );
 
+    await act(async () => {
       await resolveText('A2');
       await resolveText('B2');
     });
-    expect(Scheduler).toHaveYielded([
-      'Promise resolved [A2]',
-      'Promise resolved [B2]',
-      'A2',
-      'B2',
-    ]);
+    assertLog(['A2', 'B2']);
     expect(root).toMatchRenderedOutput(
       <>
         <span prop="A2" />
@@ -3731,18 +3600,14 @@ describe('ReactSuspenseWithNoopRenderer', () => {
   });
 
   // Regression: https://github.com/facebook/react/issues/18486
-  // @gate experimental
+  // @gate enableLegacyCache
   it('does not get stuck in pending state with render phase updates', async () => {
     let setTextWithShortTransition;
     let setTextWithLongTransition;
 
     function App() {
-      const [startShortTransition, isPending1] = React.unstable_useTransition({
-        timeoutMs: 5000,
-      });
-      const [startLongTransition, isPending2] = React.unstable_useTransition({
-        timeoutMs: 30000,
-      });
+      const [isPending1, startShortTransition] = React.useTransition();
+      const [isPending2, startLongTransition] = React.useTransition();
       const isPending = isPending1 || isPending2;
       const [text, setText] = React.useState('');
       const [mirror, setMirror] = React.useState('');
@@ -3780,23 +3645,18 @@ describe('ReactSuspenseWithNoopRenderer', () => {
     }
 
     const root = ReactNoop.createRoot();
-    await ReactNoop.act(async () => {
+    await act(() => {
       root.render(<Root />);
     });
-    expect(Scheduler).toHaveYielded(['']);
+    assertLog(['']);
     expect(root).toMatchRenderedOutput(<span prop="" />);
 
     // Update to "a". That will suspend.
-    await ReactNoop.act(async () => {
+    await act(async () => {
       setTextWithShortTransition('a');
-      expect(Scheduler).toFlushAndYield([
-        'Pending...',
-        '',
-        'Suspend! [a]',
-        'Loading...',
-      ]);
+      await waitForAll(['Pending...', '', 'Suspend! [a]', 'Loading...']);
     });
-    expect(Scheduler).toHaveYielded([]);
+    assertLog([]);
     expect(root).toMatchRenderedOutput(
       <>
         <span prop="Pending..." />
@@ -3805,9 +3665,9 @@ describe('ReactSuspenseWithNoopRenderer', () => {
     );
 
     // Update to "b". That will suspend, too.
-    await ReactNoop.act(async () => {
+    await act(async () => {
       setTextWithLongTransition('b');
-      expect(Scheduler).toFlushAndYield([
+      await waitForAll([
         // Neither is resolved yet.
         'Pending...',
         '',
@@ -3815,7 +3675,7 @@ describe('ReactSuspenseWithNoopRenderer', () => {
         'Loading...',
       ]);
     });
-    expect(Scheduler).toHaveYielded([]);
+    assertLog([]);
     expect(root).toMatchRenderedOutput(
       <>
         <span prop="Pending..." />
@@ -3824,11 +3684,10 @@ describe('ReactSuspenseWithNoopRenderer', () => {
     );
 
     // Resolve "a". But "b" is still pending.
-    await ReactNoop.act(async () => {
+    await act(async () => {
       await resolveText('a');
 
-      expect(Scheduler).toHaveYielded(['Promise resolved [a]']);
-      expect(Scheduler).toFlushAndYield(['Suspend! [b]', 'Loading...']);
+      await waitForAll(['Suspend! [b]', 'Loading...']);
       expect(root).toMatchRenderedOutput(
         <>
           <span prop="Pending..." />
@@ -3837,15 +3696,16 @@ describe('ReactSuspenseWithNoopRenderer', () => {
       );
 
       // Resolve "b". This should remove the pending state.
-      await ReactNoop.act(async () => {
+      await act(async () => {
         await resolveText('b');
       });
-      expect(Scheduler).toHaveYielded(['Promise resolved [b]', 'b']);
+      assertLog(['b']);
       // The bug was that the pending state got stuck forever.
       expect(root).toMatchRenderedOutput(<span prop="b" />);
     });
   });
 
+  // @gate enableLegacyCache
   it('regression: #18657', async () => {
     const {useState} = React;
 
@@ -3857,44 +3717,58 @@ describe('ReactSuspenseWithNoopRenderer', () => {
     }
 
     const root = ReactNoop.createRoot();
-    await ReactNoop.act(async () => {
-      await resolveText('A');
+    await act(async () => {
+      await seedNextTextCache('A');
       root.render(
         <Suspense fallback={<Text text="Loading..." />}>
           <App />
         </Suspense>,
       );
     });
-    expect(Scheduler).toHaveYielded(['A']);
+    assertLog(['A']);
     expect(root).toMatchRenderedOutput(<span prop="A" />);
 
-    await ReactNoop.act(async () => {
+    await act(async () => {
       setText('B');
-      Scheduler.unstable_runWithPriority(
-        Scheduler.unstable_IdlePriority,
-        () => {
-          setText('B');
-        },
+      ReactNoop.idleUpdates(() => {
+        setText('C');
+      });
+
+      // Suspend the first update. This triggers an immediate fallback because
+      // it wasn't wrapped in startTransition.
+      await waitForPaint(['Suspend! [B]', 'Loading...']);
+      expect(root).toMatchRenderedOutput(
+        <>
+          <span hidden={true} prop="A" />
+          <span prop="Loading..." />
+        </>,
       );
-      // Suspend the first update. The second update doesn't run because it has
-      // Idle priority.
-      expect(Scheduler).toFlushAndYield(['Suspend! [B]', 'Loading...']);
 
-      // Commit the fallback. Now we'll try working on Idle.
-      jest.runAllTimers();
-
-      // It also suspends.
-      expect(Scheduler).toFlushAndYield(['Suspend! [B]']);
+      // Once the fallback renders, proceed to the Idle update. This will
+      // also suspend.
+      await waitForAll(['Suspend! [C]']);
     });
 
-    await ReactNoop.act(async () => {
+    // Finish loading B.
+    await act(async () => {
       setText('B');
       await resolveText('B');
     });
-    expect(Scheduler).toHaveYielded(['Promise resolved [B]', 'B']);
+    // We did not try to render the Idle update again because there have been no
+    // additional updates since the last time it was attempted.
+    assertLog(['B']);
     expect(root).toMatchRenderedOutput(<span prop="B" />);
+
+    // Finish loading C.
+    await act(async () => {
+      setText('C');
+      await resolveText('C');
+    });
+    assertLog(['C']);
+    expect(root).toMatchRenderedOutput(<span prop="C" />);
   });
 
+  // @gate enableLegacyCache
   it('retries have lower priority than normal updates', async () => {
     const {useState} = React;
 
@@ -3906,7 +3780,7 @@ describe('ReactSuspenseWithNoopRenderer', () => {
     }
 
     const root = ReactNoop.createRoot();
-    await ReactNoop.act(async () => {
+    await act(() => {
       root.render(
         <>
           <UpdatingText />
@@ -3916,7 +3790,7 @@ describe('ReactSuspenseWithNoopRenderer', () => {
         </>,
       );
     });
-    expect(Scheduler).toHaveYielded(['A', 'Suspend! [Async]', 'Loading...']);
+    assertLog(['A', 'Suspend! [Async]', 'Loading...']);
     expect(root).toMatchRenderedOutput(
       <>
         <span prop="A" />
@@ -3924,15 +3798,14 @@ describe('ReactSuspenseWithNoopRenderer', () => {
       </>,
     );
 
-    await ReactNoop.act(async () => {
+    await act(async () => {
       // Resolve the promise. This will trigger a retry.
       await resolveText('Async');
-      expect(Scheduler).toHaveYielded(['Promise resolved [Async]']);
       // Before the retry happens, schedule a new update.
       setText('B');
 
       // The update should be allowed to finish before the retry is attempted.
-      expect(Scheduler).toFlushUntilNextPaint(['B']);
+      await waitForPaint(['B']);
       expect(root).toMatchRenderedOutput(
         <>
           <span prop="B" />
@@ -3941,7 +3814,7 @@ describe('ReactSuspenseWithNoopRenderer', () => {
       );
     });
     // Then do the retry.
-    expect(Scheduler).toHaveYielded(['Async']);
+    assertLog(['Async']);
     expect(root).toMatchRenderedOutput(
       <>
         <span prop="B" />
@@ -3950,6 +3823,7 @@ describe('ReactSuspenseWithNoopRenderer', () => {
     );
   });
 
+  // @gate enableLegacyCache
   it('should fire effect clean-up when deleting suspended tree', async () => {
     const {useEffect} = React;
 
@@ -3964,9 +3838,9 @@ describe('ReactSuspenseWithNoopRenderer', () => {
 
     function Child() {
       useEffect(() => {
-        Scheduler.unstable_yieldValue('Mount Child');
+        Scheduler.log('Mount Child');
         return () => {
-          Scheduler.unstable_yieldValue('Unmount Child');
+          Scheduler.log('Unmount Child');
         };
       }, []);
       return <span prop="Child" />;
@@ -3974,16 +3848,16 @@ describe('ReactSuspenseWithNoopRenderer', () => {
 
     const root = ReactNoop.createRoot();
 
-    await ReactNoop.act(async () => {
+    await act(() => {
       root.render(<App show={false} />);
     });
-    expect(Scheduler).toHaveYielded(['Mount Child']);
+    assertLog(['Mount Child']);
     expect(root).toMatchRenderedOutput(<span prop="Child" />);
 
-    await ReactNoop.act(async () => {
+    await act(() => {
       root.render(<App show={true} />);
     });
-    expect(Scheduler).toHaveYielded(['Suspend! [Async]', 'Loading...']);
+    assertLog(['Suspend! [Async]', 'Loading...']);
     expect(root).toMatchRenderedOutput(
       <>
         <span hidden={true} prop="Child" />
@@ -3991,12 +3865,13 @@ describe('ReactSuspenseWithNoopRenderer', () => {
       </>,
     );
 
-    await ReactNoop.act(async () => {
+    await act(() => {
       root.render(null);
     });
-    expect(Scheduler).toHaveYielded(['Unmount Child']);
+    assertLog(['Unmount Child']);
   });
 
+  // @gate enableLegacyCache && !disableLegacyMode
   it('should fire effect clean-up when deleting suspended tree (legacy)', async () => {
     const {useEffect} = React;
 
@@ -4011,9 +3886,9 @@ describe('ReactSuspenseWithNoopRenderer', () => {
 
     function Child() {
       useEffect(() => {
-        Scheduler.unstable_yieldValue('Mount Child');
+        Scheduler.log('Mount Child');
         return () => {
-          Scheduler.unstable_yieldValue('Unmount Child');
+          Scheduler.log('Unmount Child');
         };
       }, []);
       return <span prop="Child" />;
@@ -4021,16 +3896,16 @@ describe('ReactSuspenseWithNoopRenderer', () => {
 
     const root = ReactNoop.createLegacyRoot();
 
-    await ReactNoop.act(async () => {
+    await act(() => {
       root.render(<App show={false} />);
     });
-    expect(Scheduler).toHaveYielded(['Mount Child']);
+    assertLog(['Mount Child']);
     expect(root).toMatchRenderedOutput(<span prop="Child" />);
 
-    await ReactNoop.act(async () => {
+    await act(() => {
       root.render(<App show={true} />);
     });
-    expect(Scheduler).toHaveYielded(['Suspend! [Async]', 'Loading...']);
+    assertLog(['Suspend! [Async]', 'Loading...']);
     expect(root).toMatchRenderedOutput(
       <>
         <span hidden={true} prop="Child" />
@@ -4038,9 +3913,155 @@ describe('ReactSuspenseWithNoopRenderer', () => {
       </>,
     );
 
-    await ReactNoop.act(async () => {
+    await act(() => {
       root.render(null);
     });
-    expect(Scheduler).toHaveYielded(['Unmount Child']);
+    assertLog(['Unmount Child']);
+  });
+
+  // @gate enableLegacyCache
+  it(
+    'regression test: pinging synchronously within the render phase ' +
+      'does not unwind the stack',
+    async () => {
+      // This is a regression test that reproduces a very specific scenario that
+      // used to cause a crash.
+      const thenable = {
+        then(resolve) {
+          resolve('hi');
+        },
+        status: 'pending',
+      };
+
+      function ImmediatelyPings() {
+        if (thenable.status === 'pending') {
+          thenable.status = 'fulfilled';
+          throw thenable;
+        }
+        return <Text text="Hi" />;
+      }
+
+      function App({showMore}) {
+        return (
+          <div>
+            <Suspense fallback={<Text text="Loading..." />}>
+              {showMore ? (
+                <>
+                  <AsyncText text="Async" />
+                </>
+              ) : null}
+            </Suspense>
+            {showMore ? (
+              <Suspense>
+                <ImmediatelyPings />
+              </Suspense>
+            ) : null}
+          </div>
+        );
+      }
+
+      // Initial render. This mounts a Suspense boundary, so that in the next
+      // update we can trigger a "suspend with delay" scenario.
+      const root = ReactNoop.createRoot();
+      await act(() => {
+        root.render(<App showMore={false} />);
+      });
+      assertLog([]);
+      expect(root).toMatchRenderedOutput(<div />);
+
+      // Update. This will cause two separate trees to suspend. The first tree
+      // will be inside an already mounted Suspense boundary, so it will trigger
+      // a "suspend with delay". The second tree will be a new Suspense
+      // boundary, but the thenable that is thrown will immediately call its
+      // ping listener.
+      //
+      // Before the bug was fixed, this would lead to a `prepareFreshStack` call
+      // that unwinds the work-in-progress stack. When that code was written, it
+      // was expected that pings always happen from an asynchronous task (or
+      // microtask). But this test shows an example where that's not the case.
+      //
+      // The fix was to check if we're in the render phase before calling
+      // `prepareFreshStack`.
+      await act(() => {
+        root.render(<App showMore={true} />);
+      });
+      assertLog(['Suspend! [Async]', 'Loading...', 'Hi']);
+      expect(root).toMatchRenderedOutput(
+        <div>
+          <span prop="Loading..." />
+          <span prop="Hi" />
+        </div>,
+      );
+    },
+  );
+
+  // @gate enableLegacyCache && enableRetryLaneExpiration
+  it('recurring updates in siblings should not block expensive content in suspense boundary from committing', async () => {
+    const {useState} = React;
+
+    let setText;
+    function UpdatingText() {
+      const [text, _setText] = useState('1');
+      setText = _setText;
+      return <Text text={text} />;
+    }
+
+    function ExpensiveText({text, ms}) {
+      Scheduler.log(text);
+      Scheduler.unstable_advanceTime(ms);
+      return <span prop={text} />;
+    }
+
+    function App() {
+      return (
+        <>
+          <UpdatingText />
+          <Suspense fallback={<Text text="Loading..." />}>
+            <AsyncText text="Async" />
+            <ExpensiveText text="A" ms={1000} />
+            <ExpensiveText text="B" ms={3999} />
+            <ExpensiveText text="C" ms={100000} />
+          </Suspense>
+        </>
+      );
+    }
+
+    const root = ReactNoop.createRoot();
+    root.render(<App />);
+    await waitForAll(['1', 'Suspend! [Async]', 'Loading...']);
+    expect(root).toMatchRenderedOutput(
+      <>
+        <span prop="1" />
+        <span prop="Loading..." />
+      </>,
+    );
+
+    await resolveText('Async');
+    expect(root).toMatchRenderedOutput(
+      <>
+        <span prop="1" />
+        <span prop="Loading..." />
+      </>,
+    );
+
+    await waitFor(['Async', 'A', 'B']);
+    ReactNoop.expire(100000);
+    await advanceTimers(100000);
+    setText('2');
+    await waitForPaint(['2']);
+
+    await waitForMicrotasks();
+    Scheduler.unstable_flushNumberOfYields(1);
+    assertLog(['Async', 'A', 'B', 'C']);
+
+    expect(root).toMatchRenderedOutput(
+      <>
+        <span prop="2" />
+        <span prop="Async" />
+        <span prop="A" />
+        <span prop="B" />
+        <span prop="C" />
+      </>,
+    );
   });
 });

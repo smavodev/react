@@ -1,5 +1,5 @@
 /**
- * Copyright (c) Facebook, Inc. and its affiliates.
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
  *
  * This source code is licensed under the MIT license found in the
  * LICENSE file in the root directory of this source tree.
@@ -8,29 +8,37 @@
  */
 
 import * as React from 'react';
-import {useEffect, useRef, useState} from 'react';
+import {useTransition, useContext, useRef, useState, useMemo} from 'react';
+import {OptionsContext} from '../context';
 import EditableName from './EditableName';
 import EditableValue from './EditableValue';
 import NewArrayValue from './NewArrayValue';
 import NewKeyValue from './NewKeyValue';
+import LoadingAnimation from './LoadingAnimation';
 import ExpandCollapseToggle from './ExpandCollapseToggle';
 import {alphaSortEntries, getMetaValueLabel} from '../utils';
 import {meta} from '../../../hydration';
-import useContextMenu from '../../ContextMenu/useContextMenu';
 import Store from '../../store';
 import {parseHookPathForEdit} from './utils';
 import styles from './KeyValue.css';
 import Button from 'react-devtools-shared/src/devtools/views/Button';
 import ButtonIcon from 'react-devtools-shared/src/devtools/views/ButtonIcon';
+import isArray from 'react-devtools-shared/src/isArray';
+import {InspectedElementContext} from './InspectedElementContext';
+import {PROTOCOLS_SUPPORTED_AS_LINKS_IN_KEY_VALUE} from './constants';
+import KeyValueContextMenuContainer from './KeyValueContextMenuContainer';
 
-import type {InspectedElement} from './types';
-import type {Element} from 'react';
+import type {InspectedElement} from 'react-devtools-shared/src/frontend/types';
+import type {Element} from 'react-devtools-shared/src/frontend/types';
+import type {Element as ReactElement} from 'react';
 import type {FrontendBridge} from 'react-devtools-shared/src/bridge';
-import type {GetInspectedElementPath} from './InspectedElementContext';
+
+// $FlowFixMe[method-unbinding]
+const hasOwnProperty = Object.prototype.hasOwnProperty;
 
 type Type = 'props' | 'state' | 'context' | 'hooks';
 
-type KeyValueProps = {|
+type KeyValueProps = {
   alphaSort: boolean,
   bridge: FrontendBridge,
   canDeletePaths: boolean,
@@ -38,9 +46,10 @@ type KeyValueProps = {|
   canRenamePaths: boolean,
   canRenamePathsAtDepth?: (depth: number) => boolean,
   depth: number,
+  element: Element,
   hidden: boolean,
   hookID?: ?number,
-  getInspectedElementPath: GetInspectedElementPath,
+  hookName?: ?string,
   inspectedElement: InspectedElement,
   isDirectChildOfAnArray?: boolean,
   name: string,
@@ -48,7 +57,7 @@ type KeyValueProps = {|
   pathRoot: Type,
   store: Store,
   value: any,
-|};
+};
 
 export default function KeyValue({
   alphaSort,
@@ -58,52 +67,52 @@ export default function KeyValue({
   canRenamePaths,
   canRenamePathsAtDepth,
   depth,
-  getInspectedElementPath,
+  element,
   inspectedElement,
   isDirectChildOfAnArray,
   hidden,
   hookID,
+  hookName,
   name,
   path,
   pathRoot,
   store,
   value,
-}: KeyValueProps) {
+}: KeyValueProps): React.Node {
+  const {readOnly: readOnlyGlobalFlag} = useContext(OptionsContext);
+  canDeletePaths = !readOnlyGlobalFlag && canDeletePaths;
+  canEditValues = !readOnlyGlobalFlag && canEditValues;
+  canRenamePaths = !readOnlyGlobalFlag && canRenamePaths;
+
   const {id} = inspectedElement;
+  const fullPath = useMemo(() => [pathRoot, ...path], [pathRoot, path]);
 
   const [isOpen, setIsOpen] = useState<boolean>(false);
-  const prevIsOpenRef = useRef(isOpen);
   const contextMenuTriggerRef = useRef(null);
 
+  const {inspectPaths} = useContext(InspectedElementContext);
+
   let isInspectable = false;
-  let isReadOnly = false;
+  let isReadOnlyBasedOnMetadata = false;
   if (value !== null && typeof value === 'object') {
     isInspectable = value[meta.inspectable] && value[meta.size] !== 0;
-    isReadOnly = value[meta.readonly];
+    isReadOnlyBasedOnMetadata = value[meta.readonly];
   }
 
-  useEffect(() => {
-    if (isInspectable && isOpen && !prevIsOpenRef.current) {
-      getInspectedElementPath(id, [pathRoot, ...path]);
+  const [isInspectPathsPending, startInspectPathsTransition] = useTransition();
+  const toggleIsOpen = () => {
+    if (isOpen) {
+      setIsOpen(false);
+    } else {
+      setIsOpen(true);
+
+      if (isInspectable) {
+        startInspectPathsTransition(() => {
+          inspectPaths([pathRoot, ...path]);
+        });
+      }
     }
-    prevIsOpenRef.current = isOpen;
-  }, [getInspectedElementPath, isInspectable, isOpen, path, pathRoot]);
-
-  const toggleIsOpen = () => setIsOpen(prevIsOpen => !prevIsOpen);
-
-  useContextMenu({
-    data: {
-      path: [pathRoot, ...path],
-      type:
-        value !== null &&
-        typeof value === 'object' &&
-        hasOwnProperty.call(value, meta.type)
-          ? value[meta.type]
-          : typeof value,
-    },
-    id: 'InspectedElement',
-    ref: contextMenuTriggerRef,
-  });
+  };
 
   const dataType = typeof value;
   const isSimpleType =
@@ -112,11 +121,19 @@ export default function KeyValue({
     dataType === 'boolean' ||
     value == null;
 
+  const pathType =
+    value !== null &&
+    typeof value === 'object' &&
+    hasOwnProperty.call(value, meta.type)
+      ? value[meta.type]
+      : typeof value;
+  const pathIsFunction = pathType === 'function';
+
   const style = {
     paddingLeft: `${(depth - 1) * 0.75}rem`,
   };
 
-  const overrideValue = (newPath, newValue) => {
+  const overrideValue = (newPath: Array<string | number>, newValue: any) => {
     if (hookID != null) {
       newPath = parseHookPathForEdit(newPath);
     }
@@ -134,7 +151,7 @@ export default function KeyValue({
     }
   };
 
-  const deletePath = pathToDelete => {
+  const deletePath = (pathToDelete: Array<string | number>) => {
     if (hookID != null) {
       pathToDelete = parseHookPathForEdit(pathToDelete);
     }
@@ -151,7 +168,10 @@ export default function KeyValue({
     }
   };
 
-  const renamePath = (oldPath, newPath) => {
+  const renamePath = (
+    oldPath: Array<string | number>,
+    newPath: Array<string | number>,
+  ) => {
     if (newPath[newPath.length - 1] === '') {
       // Deleting the key suggests an intent to delete the whole path.
       if (canDeletePaths) {
@@ -193,7 +213,12 @@ export default function KeyValue({
         <DeleteToggle name={name} deletePath={deletePath} path={path} />
       );
     } else {
-      renderedName = <span className={styles.Name}>{name}</span>;
+      renderedName = (
+        <span className={styles.Name}>
+          {name}
+          {!!hookName && <span className={styles.HookName}>({hookName})</span>}
+        </span>
+      );
     }
   } else if (canRenameTheCurrentPath) {
     renderedName = (
@@ -206,7 +231,12 @@ export default function KeyValue({
       />
     );
   } else {
-    renderedName = <span className={styles.Name}>{name}</span>;
+    renderedName = (
+      <span className={styles.Name} data-testname="NonEditableName">
+        {name}
+        {!!hookName && <span className={styles.HookName}>({hookName})</span>}
+      </span>
+    );
   }
 
   let children = null;
@@ -220,56 +250,110 @@ export default function KeyValue({
       displayValue = 'null';
     } else if (value === undefined) {
       displayValue = 'undefined';
+    } else if (isNaN(value)) {
+      displayValue = 'NaN';
+    }
+
+    let shouldDisplayValueAsLink = false;
+    if (
+      dataType === 'string' &&
+      PROTOCOLS_SUPPORTED_AS_LINKS_IN_KEY_VALUE.some(protocolPrefix =>
+        value.startsWith(protocolPrefix),
+      )
+    ) {
+      shouldDisplayValueAsLink = true;
     }
 
     children = (
-      <div
+      <KeyValueContextMenuContainer
         key="root"
-        className={styles.Item}
-        hidden={hidden}
-        ref={contextMenuTriggerRef}
-        style={style}>
-        <div className={styles.ExpandCollapseToggleSpacer} />
-        {renderedName}
-        <div className={styles.AfterName}>:</div>
-        {canEditValues ? (
-          <EditableValue
-            overrideValue={overrideValue}
-            path={path}
-            value={value}
-          />
-        ) : (
-          <span className={styles.Value}>{displayValue}</span>
-        )}
-      </div>
+        anchorElementRef={contextMenuTriggerRef}
+        attributeSourceCanBeInspected={pathIsFunction}
+        canBeCopiedToClipboard={!pathIsFunction}
+        store={store}
+        bridge={bridge}
+        id={id}
+        path={fullPath}>
+        <div
+          data-testname="KeyValue"
+          className={styles.Item}
+          hidden={hidden}
+          ref={contextMenuTriggerRef}
+          style={style}>
+          <div className={styles.ExpandCollapseToggleSpacer} />
+          {renderedName}
+          <div className={styles.AfterName}>:</div>
+          {canEditValues ? (
+            <EditableValue
+              overrideValue={overrideValue}
+              path={path}
+              value={value}
+            />
+          ) : shouldDisplayValueAsLink ? (
+            <a
+              className={styles.Link}
+              href={value}
+              target="_blank"
+              rel="noopener noreferrer">
+              {displayValue}
+            </a>
+          ) : (
+            <span className={styles.Value} data-testname="NonEditableValue">
+              {displayValue}
+            </span>
+          )}
+        </div>
+      </KeyValueContextMenuContainer>
     );
   } else if (
     hasOwnProperty.call(value, meta.type) &&
     !hasOwnProperty.call(value, meta.unserializable)
   ) {
     children = (
-      <div
+      <KeyValueContextMenuContainer
         key="root"
-        className={styles.Item}
-        hidden={hidden}
-        ref={contextMenuTriggerRef}
-        style={style}>
-        {isInspectable ? (
-          <ExpandCollapseToggle isOpen={isOpen} setIsOpen={setIsOpen} />
-        ) : (
-          <div className={styles.ExpandCollapseToggleSpacer} />
-        )}
-        {renderedName}
-        <div className={styles.AfterName}>:</div>
-        <span
-          className={styles.Value}
-          onClick={isInspectable ? toggleIsOpen : undefined}>
-          {getMetaValueLabel(value)}
-        </span>
-      </div>
+        anchorElementRef={contextMenuTriggerRef}
+        attributeSourceCanBeInspected={pathIsFunction}
+        canBeCopiedToClipboard={!pathIsFunction}
+        store={store}
+        bridge={bridge}
+        id={id}
+        path={fullPath}>
+        <div
+          data-testname="KeyValue"
+          className={styles.Item}
+          hidden={hidden}
+          ref={contextMenuTriggerRef}
+          style={style}>
+          {isInspectable ? (
+            <ExpandCollapseToggle isOpen={isOpen} setIsOpen={toggleIsOpen} />
+          ) : (
+            <div className={styles.ExpandCollapseToggleSpacer} />
+          )}
+          {renderedName}
+          <div className={styles.AfterName}>:</div>
+          <span
+            className={styles.Value}
+            onClick={isInspectable ? toggleIsOpen : undefined}>
+            {getMetaValueLabel(value)}
+          </span>
+        </div>
+      </KeyValueContextMenuContainer>
     );
+
+    if (isInspectPathsPending) {
+      children = (
+        <>
+          {children}
+          <div className={styles.Item} style={style}>
+            <div className={styles.ExpandCollapseToggleSpacer} />
+            <LoadingAnimation />
+          </div>
+        </>
+      );
+    }
   } else {
-    if (Array.isArray(value)) {
+    if (isArray(value)) {
       const hasChildren = value.length > 0 || canEditValues;
       const displayName = getMetaValueLabel(value);
 
@@ -278,12 +362,12 @@ export default function KeyValue({
           key={index}
           alphaSort={alphaSort}
           bridge={bridge}
-          canDeletePaths={canDeletePaths && !isReadOnly}
-          canEditValues={canEditValues && !isReadOnly}
-          canRenamePaths={canRenamePaths && !isReadOnly}
+          canDeletePaths={canDeletePaths && !isReadOnlyBasedOnMetadata}
+          canEditValues={canEditValues && !isReadOnlyBasedOnMetadata}
+          canRenamePaths={canRenamePaths && !isReadOnlyBasedOnMetadata}
           canRenamePathsAtDepth={canRenamePathsAtDepth}
           depth={depth + 1}
-          getInspectedElementPath={getInspectedElementPath}
+          element={element}
           hookID={hookID}
           inspectedElement={inspectedElement}
           isDirectChildOfAnArray={true}
@@ -296,7 +380,7 @@ export default function KeyValue({
         />
       ));
 
-      if (canEditValues && !isReadOnly) {
+      if (canEditValues && !isReadOnlyBasedOnMetadata) {
         children.push(
           <NewArrayValue
             key="NewKeyValue"
@@ -305,7 +389,7 @@ export default function KeyValue({
             hidden={hidden || !isOpen}
             hookID={hookID}
             index={value.length}
-            getInspectedElementPath={getInspectedElementPath}
+            element={element}
             inspectedElement={inspectedElement}
             path={path}
             store={store}
@@ -315,25 +399,35 @@ export default function KeyValue({
       }
 
       children.unshift(
-        <div
+        <KeyValueContextMenuContainer
           key={`${depth}-root`}
-          className={styles.Item}
-          hidden={hidden}
-          ref={contextMenuTriggerRef}
-          style={style}>
-          {hasChildren ? (
-            <ExpandCollapseToggle isOpen={isOpen} setIsOpen={setIsOpen} />
-          ) : (
-            <div className={styles.ExpandCollapseToggleSpacer} />
-          )}
-          {renderedName}
-          <div className={styles.AfterName}>:</div>
-          <span
-            className={styles.Value}
-            onClick={hasChildren ? toggleIsOpen : undefined}>
-            {displayName}
-          </span>
-        </div>,
+          anchorElementRef={contextMenuTriggerRef}
+          attributeSourceCanBeInspected={pathIsFunction}
+          canBeCopiedToClipboard={!pathIsFunction}
+          store={store}
+          bridge={bridge}
+          id={id}
+          path={fullPath}>
+          <div
+            data-testname="KeyValue"
+            className={styles.Item}
+            hidden={hidden}
+            ref={contextMenuTriggerRef}
+            style={style}>
+            {hasChildren ? (
+              <ExpandCollapseToggle isOpen={isOpen} setIsOpen={setIsOpen} />
+            ) : (
+              <div className={styles.ExpandCollapseToggleSpacer} />
+            )}
+            {renderedName}
+            <div className={styles.AfterName}>:</div>
+            <span
+              className={styles.Value}
+              onClick={hasChildren ? toggleIsOpen : undefined}>
+              {displayName}
+            </span>
+          </div>
+        </KeyValueContextMenuContainer>,
       );
     } else {
       // TRICKY
@@ -347,17 +441,17 @@ export default function KeyValue({
       const hasChildren = entries.length > 0 || canEditValues;
       const displayName = getMetaValueLabel(value);
 
-      children = entries.map<Element<any>>(([key, keyValue]) => (
+      children = entries.map(([key, keyValue]): ReactElement<any> => (
         <KeyValue
           key={key}
           alphaSort={alphaSort}
           bridge={bridge}
-          canDeletePaths={canDeletePaths && !isReadOnly}
-          canEditValues={canEditValues && !isReadOnly}
-          canRenamePaths={canRenamePaths && !isReadOnly}
+          canDeletePaths={canDeletePaths && !isReadOnlyBasedOnMetadata}
+          canEditValues={canEditValues && !isReadOnlyBasedOnMetadata}
+          canRenamePaths={canRenamePaths && !isReadOnlyBasedOnMetadata}
           canRenamePathsAtDepth={canRenamePathsAtDepth}
           depth={depth + 1}
-          getInspectedElementPath={getInspectedElementPath}
+          element={element}
           hookID={hookID}
           inspectedElement={inspectedElement}
           hidden={hidden || !isOpen}
@@ -369,13 +463,13 @@ export default function KeyValue({
         />
       ));
 
-      if (canEditValues && !isReadOnly) {
+      if (canEditValues && !isReadOnlyBasedOnMetadata) {
         children.push(
           <NewKeyValue
             key="NewKeyValue"
             bridge={bridge}
             depth={depth + 1}
-            getInspectedElementPath={getInspectedElementPath}
+            element={element}
             hidden={hidden || !isOpen}
             hookID={hookID}
             inspectedElement={inspectedElement}
@@ -387,25 +481,35 @@ export default function KeyValue({
       }
 
       children.unshift(
-        <div
+        <KeyValueContextMenuContainer
           key={`${depth}-root`}
-          className={styles.Item}
-          hidden={hidden}
-          ref={contextMenuTriggerRef}
-          style={style}>
-          {hasChildren ? (
-            <ExpandCollapseToggle isOpen={isOpen} setIsOpen={setIsOpen} />
-          ) : (
-            <div className={styles.ExpandCollapseToggleSpacer} />
-          )}
-          {renderedName}
-          <div className={styles.AfterName}>:</div>
-          <span
-            className={styles.Value}
-            onClick={hasChildren ? toggleIsOpen : undefined}>
-            {displayName}
-          </span>
-        </div>,
+          anchorElementRef={contextMenuTriggerRef}
+          attributeSourceCanBeInspected={pathIsFunction}
+          canBeCopiedToClipboard={!pathIsFunction}
+          store={store}
+          bridge={bridge}
+          id={id}
+          path={fullPath}>
+          <div
+            data-testname="KeyValue"
+            className={styles.Item}
+            hidden={hidden}
+            ref={contextMenuTriggerRef}
+            style={style}>
+            {hasChildren ? (
+              <ExpandCollapseToggle isOpen={isOpen} setIsOpen={setIsOpen} />
+            ) : (
+              <div className={styles.ExpandCollapseToggleSpacer} />
+            )}
+            {renderedName}
+            <div className={styles.AfterName}>:</div>
+            <span
+              className={styles.Value}
+              onClick={hasChildren ? toggleIsOpen : undefined}>
+              {displayName}
+            </span>
+          </div>
+        </KeyValueContextMenuContainer>,
       );
     }
   }
@@ -413,7 +517,9 @@ export default function KeyValue({
   return children;
 }
 
+// $FlowFixMe[missing-local-annot]
 function DeleteToggle({deletePath, name, path}) {
+  // $FlowFixMe[missing-local-annot]
   const handleClick = event => {
     event.stopPropagation();
     deletePath(path);

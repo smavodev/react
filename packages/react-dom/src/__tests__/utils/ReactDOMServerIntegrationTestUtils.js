@@ -1,5 +1,5 @@
 /**
- * Copyright (c) Facebook, Inc. and its affiliates.
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
  *
  * This source code is licensed under the MIT license found in the
  * LICENSE file in the root directory of this source tree.
@@ -10,14 +10,19 @@
 'use strict';
 
 const stream = require('stream');
+const shouldIgnoreConsoleError = require('internal-test-utils/shouldIgnoreConsoleError');
 
-module.exports = function(initModules) {
+module.exports = function (initModules) {
   let ReactDOM;
+  let ReactDOMClient;
   let ReactDOMServer;
-  let ReactTestUtils;
+  let act;
+  let ReactFeatureFlags;
 
   function resetModules() {
-    ({ReactDOM, ReactDOMServer, ReactTestUtils} = initModules());
+    ({ReactDOM, ReactDOMClient, ReactDOMServer} = initModules());
+    act = require('internal-test-utils').act;
+    ReactFeatureFlags = require('shared/ReactFeatureFlags');
   }
 
   function shouldUseDocument(reactElement) {
@@ -46,51 +51,74 @@ module.exports = function(initModules) {
   // ====================================
 
   // promisified version of ReactDOM.render()
-  function asyncReactDOMRender(reactElement, domElement, forceHydrate) {
-    return new Promise(resolve => {
-      if (forceHydrate) {
-        ReactTestUtils.unstable_concurrentAct(() => {
-          ReactDOM.hydrate(reactElement, domElement);
+  async function asyncReactDOMRender(reactElement, domElement, forceHydrate) {
+    if (forceHydrate) {
+      await act(() => {
+        ReactDOMClient.hydrateRoot(domElement, reactElement, {
+          onRecoverableError(e) {
+            if (
+              e.message.startsWith(
+                'There was an error while hydrating. Because the error happened outside of a Suspense boundary, the entire root will switch to client rendering.',
+              )
+            ) {
+              // We ignore this extra error because it shouldn't really need to be there if
+              // a hydration mismatch is the cause of it.
+            } else {
+              console.error(e);
+            }
+          },
         });
-      } else {
-        ReactTestUtils.unstable_concurrentAct(() => {
+      });
+    } else {
+      await act(() => {
+        if (ReactDOMClient) {
+          const root = ReactDOMClient.createRoot(domElement);
+          root.render(reactElement);
+        } else {
           ReactDOM.render(reactElement, domElement);
-        });
-      }
-      // We can't use the callback for resolution because that will not catch
-      // errors. They're thrown.
-      resolve();
-    });
+        }
+      });
+    }
   }
   // performs fn asynchronously and expects count errors logged to console.error.
   // will fail the test if the count of errors logged is not equal to count.
   async function expectErrors(fn, count) {
-    if (console.error.calls && console.error.calls.reset) {
-      console.error.calls.reset();
+    if (console.error.mockClear) {
+      console.error.mockClear();
     } else {
       // TODO: Rewrite tests that use this helper to enumerate expected errors.
       // This will enable the helper to use the .toErrorDev() matcher instead of spying.
-      spyOnDev(console, 'error');
+      spyOnDev(console, 'error').mockImplementation(() => {});
     }
 
     const result = await fn();
     if (
-      console.error.calls &&
-      console.error.calls.count() !== count &&
-      console.error.calls.count() !== 0
+      console.error.mock &&
+      console.error.mock.calls &&
+      console.error.mock.calls.length !== 0
     ) {
-      console.log(
-        `We expected ${count} warning(s), but saw ${console.error.calls.count()} warning(s).`,
-      );
-      if (console.error.calls.count() > 0) {
-        console.log(`We saw these warnings:`);
-        for (let i = 0; i < console.error.calls.count(); i++) {
-          console.log(...console.error.calls.argsFor(i));
+      const filteredWarnings = [];
+      for (let i = 0; i < console.error.mock.calls.length; i++) {
+        const args = console.error.mock.calls[i];
+        const [format, ...rest] = args;
+        if (!shouldIgnoreConsoleError(format, rest)) {
+          filteredWarnings.push(args);
         }
       }
-    }
-    if (__DEV__) {
-      expect(console.error).toHaveBeenCalledTimes(count);
+      if (filteredWarnings.length !== count) {
+        console.log(
+          `We expected ${count} warning(s), but saw ${filteredWarnings.length} warning(s).`,
+        );
+        if (filteredWarnings.length > 0) {
+          console.log(`We saw these warnings:`);
+          for (let i = 0; i < filteredWarnings.length; i++) {
+            console.log(...filteredWarnings[i]);
+          }
+        }
+        if (__DEV__) {
+          expect(console.error).toHaveBeenCalledTimes(count);
+        }
+      }
     }
     return result;
   }
@@ -146,8 +174,11 @@ module.exports = function(initModules) {
       () =>
         new Promise((resolve, reject) => {
           const writable = new DrainWritable();
-          const s = ReactDOMServer.renderToNodeStream(reactElement);
-          s.on('error', e => reject(e));
+          const s = ReactDOMServer.renderToPipeableStream(reactElement, {
+            onShellError(e) {
+              reject(e);
+            },
+          });
           s.pipe(writable);
           writable.on('finish', () => resolve(writable.buffer));
         }),
@@ -160,7 +191,12 @@ module.exports = function(initModules) {
   // Does not render on client or perform client-side revival.
   async function streamRender(reactElement, errorCount = 0) {
     const markup = await renderIntoStream(reactElement, errorCount);
-    return getContainerFromMarkup(reactElement, markup).firstChild;
+    let firstNode = getContainerFromMarkup(reactElement, markup).firstChild;
+    if (firstNode && firstNode.nodeType === Node.DOCUMENT_TYPE_NODE) {
+      // Skip document type nodes.
+      firstNode = firstNode.nextSibling;
+    }
+    return firstNode;
   }
 
   const clientCleanRender = (element, errorCount = 0) => {
@@ -211,7 +247,7 @@ module.exports = function(initModules) {
       element,
       shouldUseDocument(element)
         ? '<html><body><div id="badIdWhichWillCauseMismatch" /></body></html>'
-        : '<div id="badIdWhichWillCauseMismatch" data-reactroot="" data-reactid="1"></div>',
+        : '<div id="badIdWhichWillCauseMismatch"></div>',
     );
 
     await renderIntoDom(element, container, true, errorCount + 1);
@@ -225,8 +261,10 @@ module.exports = function(initModules) {
     if (shouldUseDocument(element)) {
       // We can't render into a document during a clean render,
       // so instead, we'll render the children into the document element.
-      cleanContainer = getContainerFromMarkup(element, '<html></html>')
-        .documentElement;
+      cleanContainer = getContainerFromMarkup(
+        element,
+        '<html></html>',
+      ).documentElement;
       element = element.props.children;
     } else {
       cleanContainer = document.createElement('div');
@@ -234,10 +272,12 @@ module.exports = function(initModules) {
     await asyncReactDOMRender(element, cleanContainer, true);
     // This gives us the expected text content.
     const cleanTextContent =
-      cleanContainer.lastChild && cleanContainer.lastChild.textContent;
+      (cleanContainer.lastChild && cleanContainer.lastChild.textContent) || '';
 
-    // The only guarantee is that text content has been patched up if needed.
-    expect(hydratedTextContent).toBe(cleanTextContent);
+    if (ReactFeatureFlags.favorSafetyOverHydrationPerf) {
+      // The only guarantee is that text content has been patched up if needed.
+      expect(hydratedTextContent).toBe(cleanTextContent);
+    }
 
     // Abort any further expects. All bets are off at this point.
     throw new BadMarkupExpected();

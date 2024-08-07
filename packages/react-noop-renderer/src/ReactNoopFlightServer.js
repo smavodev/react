@@ -1,5 +1,5 @@
 /**
- * Copyright (c) Facebook, Inc. and its affiliates.
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
  *
  * This source code is licensed under the MIT license found in the
  * LICENSE file in the root directory of this source tree.
@@ -14,57 +14,81 @@
  * environment.
  */
 
-import type {ReactModel} from 'react-server/src/ReactFlightServer';
+import type {ReactClientValue} from 'react-server/src/ReactFlightServer';
 
 import {saveModule} from 'react-noop-renderer/flight-modules';
 
 import ReactFlightServer from 'react-server/flight';
 
-type Destination = Array<string>;
+type Destination = Array<Uint8Array>;
+
+const textEncoder = new TextEncoder();
 
 const ReactNoopFlightServer = ReactFlightServer({
+  scheduleMicrotask(callback: () => void) {
+    callback();
+  },
   scheduleWork(callback: () => void) {
     callback();
   },
   beginWriting(destination: Destination): void {},
-  writeChunk(destination: Destination, buffer: Uint8Array): void {
-    destination.push(Buffer.from((buffer: any)).toString('utf8'));
+  writeChunk(destination: Destination, chunk: string): void {
+    destination.push(chunk);
+  },
+  writeChunkAndReturn(destination: Destination, chunk: string): boolean {
+    destination.push(chunk);
+    return true;
   },
   completeWriting(destination: Destination): void {},
   close(destination: Destination): void {},
+  closeWithError(destination: Destination, error: mixed): void {},
   flushBuffered(destination: Destination): void {},
-  convertStringToBuffer(content: string): Uint8Array {
-    return Buffer.from(content, 'utf8');
+  stringToChunk(content: string): Uint8Array {
+    return textEncoder.encode(content);
   },
-  formatChunkAsString(type: string, props: Object): string {
-    return JSON.stringify({type, props});
+  stringToPrecomputedChunk(content: string): Uint8Array {
+    return textEncoder.encode(content);
   },
-  formatChunk(type: string, props: Object): Uint8Array {
-    return Buffer.from(JSON.stringify({type, props}), 'utf8');
+  isClientReference(reference: Object): boolean {
+    return reference.$$typeof === Symbol.for('react.client.reference');
   },
-  isModuleReference(reference: Object): boolean {
-    return reference.$$typeof === Symbol.for('react.module.reference');
+  isServerReference(reference: Object): boolean {
+    return reference.$$typeof === Symbol.for('react.server.reference');
   },
-  getModuleKey(reference: Object): Object {
+  getClientReferenceKey(reference: Object): Object {
     return reference;
   },
-  resolveModuleMetaData(
+  resolveClientReferenceMetadata(
     config: void,
-    reference: {$$typeof: Symbol, value: any},
+    reference: {$$typeof: symbol, value: any},
   ) {
     return saveModule(reference.value);
   },
 });
 
-function render(model: ReactModel): Destination {
+type Options = {
+  environmentName?: string | (() => string),
+  filterStackFrame?: (url: string, functionName: string) => boolean,
+  identifierPrefix?: string,
+  onError?: (error: mixed) => void,
+  onPostpone?: (reason: string) => void,
+};
+
+function render(model: ReactClientValue, options?: Options): Destination {
   const destination: Destination = [];
   const bundlerConfig = undefined;
   const request = ReactNoopFlightServer.createRequest(
     model,
-    destination,
     bundlerConfig,
+    options ? options.onError : undefined,
+    options ? options.identifierPrefix : undefined,
+    options ? options.onPostpone : undefined,
+    undefined,
+    __DEV__ && options ? options.environmentName : undefined,
+    __DEV__ && options ? options.filterStackFrame : undefined,
   );
   ReactNoopFlightServer.startWork(request);
+  ReactNoopFlightServer.startFlowing(request, destination);
   return destination;
 }
 

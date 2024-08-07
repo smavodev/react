@@ -1,5 +1,5 @@
 /**
- * Copyright (c) Facebook, Inc. and its affiliates.
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
  *
  * This source code is licensed under the MIT license found in the
  * LICENSE file in the root directory of this source tree.
@@ -9,54 +9,201 @@
 
 let React;
 let ReactNoop;
+let Scheduler;
+let act;
+let Suspense;
+let SuspenseList;
+let getCacheForType;
+let caches;
+let seededCache;
+let assertLog;
 
 beforeEach(() => {
   React = require('react');
   ReactNoop = require('react-noop-renderer');
+  Scheduler = require('scheduler');
+  act = require('internal-test-utils').act;
+
+  const InternalTestUtils = require('internal-test-utils');
+  assertLog = InternalTestUtils.assertLog;
+
+  Suspense = React.Suspense;
+  if (gate(flags => flags.enableSuspenseList)) {
+    SuspenseList = React.unstable_SuspenseList;
+  }
+
+  getCacheForType = React.unstable_getCacheForType;
+
+  caches = [];
+  seededCache = null;
 });
 
-// Don't feel too guilty if you have to delete this test.
-// @gate dfsEffectsRefactor
-// @gate new
-// @gate __DEV__
-test('warns in DEV if return pointer is inconsistent', async () => {
-  const {useRef, useLayoutEffect} = React;
+function createTextCache() {
+  if (seededCache !== null) {
+    // Trick to seed a cache before it exists.
+    // TODO: Need a built-in API to seed data before the initial render (i.e.
+    // not a refresh because nothing has mounted yet).
+    const cache = seededCache;
+    seededCache = null;
+    return cache;
+  }
 
-  let ref = null;
-  function App({text}) {
-    ref = useRef(null);
+  const data = new Map();
+  const version = caches.length + 1;
+  const cache = {
+    version,
+    data,
+    resolve(text) {
+      const record = data.get(text);
+      if (record === undefined) {
+        const newRecord = {
+          status: 'resolved',
+          value: text,
+        };
+        data.set(text, newRecord);
+      } else if (record.status === 'pending') {
+        const thenable = record.value;
+        record.status = 'resolved';
+        record.value = text;
+        thenable.pings.forEach(t => t());
+      }
+    },
+    reject(text, error) {
+      const record = data.get(text);
+      if (record === undefined) {
+        const newRecord = {
+          status: 'rejected',
+          value: error,
+        };
+        data.set(text, newRecord);
+      } else if (record.status === 'pending') {
+        const thenable = record.value;
+        record.status = 'rejected';
+        record.value = error;
+        thenable.pings.forEach(t => t());
+      }
+    },
+  };
+  caches.push(cache);
+  return cache;
+}
+
+function readText(text) {
+  const textCache = getCacheForType(createTextCache);
+  const record = textCache.data.get(text);
+  if (record !== undefined) {
+    switch (record.status) {
+      case 'pending':
+        Scheduler.log(`Suspend! [${text}]`);
+        throw record.value;
+      case 'rejected':
+        Scheduler.log(`Error! [${text}]`);
+        throw record.value;
+      case 'resolved':
+        return textCache.version;
+    }
+  } else {
+    Scheduler.log(`Suspend! [${text}]`);
+
+    const thenable = {
+      pings: [],
+      then(resolve) {
+        if (newRecord.status === 'pending') {
+          thenable.pings.push(resolve);
+        } else {
+          Promise.resolve().then(() => resolve(newRecord.value));
+        }
+      },
+    };
+
+    const newRecord = {
+      status: 'pending',
+      value: thenable,
+    };
+    textCache.data.set(text, newRecord);
+
+    throw thenable;
+  }
+}
+
+function Text({text}) {
+  Scheduler.log(text);
+  return <span prop={text} />;
+}
+
+function AsyncText({text, showVersion}) {
+  const version = readText(text);
+  const fullText = showVersion ? `${text} [v${version}]` : text;
+  Scheduler.log(fullText);
+  return <span prop={fullText} />;
+}
+
+// function seedNextTextCache(text) {
+//   if (seededCache === null) {
+//     seededCache = createTextCache();
+//   }
+//   seededCache.resolve(text);
+// }
+
+function resolveMostRecentTextCache(text) {
+  if (caches.length === 0) {
+    throw Error('Cache does not exist.');
+  } else {
+    // Resolve the most recently created cache. An older cache can by
+    // resolved with `caches[index].resolve(text)`.
+    caches[caches.length - 1].resolve(text);
+  }
+}
+
+const resolveText = resolveMostRecentTextCache;
+
+// @gate enableLegacyCache
+// @gate enableSuspenseList
+test('regression (#20932): return pointer is correct before entering deleted tree', async () => {
+  // Based on a production bug. Designed to trigger a very specific
+  // implementation path.
+  function Tail() {
     return (
-      <>
-        <Sibling text={text} />
-        <div ref={ref}>{text}</div>
-      </>
+      <Suspense fallback={<Text text="Loading Tail..." />}>
+        <Text text="Tail" />
+      </Suspense>
     );
   }
 
-  function Sibling({text}) {
-    useLayoutEffect(() => {
-      if (text === 'B') {
-        // Mutate the return pointer of the div to point to the wrong alternate.
-        // This simulates the most common type of return pointer inconsistency.
-        const current = ref.current.fiber;
-        const workInProgress = current.alternate;
-        workInProgress.return = current.return;
-      }
-    }, [text]);
-    return null;
+  function App() {
+    return (
+      <SuspenseList revealOrder="forwards">
+        <Suspense fallback={<Text text="Loading Async..." />}>
+          <Async />
+        </Suspense>
+        <Tail />
+      </SuspenseList>
+    );
+  }
+
+  let setAsyncText;
+  function Async() {
+    const [c, _setAsyncText] = React.useState(0);
+    setAsyncText = _setAsyncText;
+    return <AsyncText text={c} />;
   }
 
   const root = ReactNoop.createRoot();
-  await ReactNoop.act(async () => {
-    root.render(<App text="A" />);
+  await act(() => {
+    root.render(<App />);
   });
-
-  spyOnDev(console, 'error');
-  await ReactNoop.act(async () => {
-    root.render(<App text="B" />);
+  assertLog(['Suspend! [0]', 'Loading Async...', 'Loading Tail...']);
+  await act(() => {
+    resolveText(0);
   });
-  expect(console.error.calls.count()).toBe(1);
-  expect(console.error.calls.argsFor(0)[0]).toMatch(
-    'Internal React error: Return pointer is inconsistent with parent.',
-  );
+  assertLog([0, 'Tail']);
+  await act(() => {
+    setAsyncText(x => x + 1);
+  });
+  assertLog([
+    'Suspend! [1]',
+    'Loading Async...',
+    'Suspend! [1]',
+    'Loading Async...',
+  ]);
 });
